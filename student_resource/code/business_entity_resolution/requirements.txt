@@ -1,0 +1,6 @@
+pandas>=2.2
+numpy>=2.0
+scikit-learn>=1.5
+lightgbm>=4.6
+rapidfuzz>=3.9
+unidecode>=1.3
