@@ -28,10 +28,10 @@ KEY_WEIGHT = {
     "addr_token": 1,
 }
 
-DEFAULT_MAX_BLOCK_SIZE = 200
+DEFAULT_MAX_BLOCK_SIZE = 2000
 # name_full is a much stronger signal (whole normalized name matches exactly),
 # so it tolerates a far higher block size before being purged as uninformative.
-DEFAULT_MAX_BLOCK_SIZE_OVERRIDES = {"name_full": 2000}
+DEFAULT_MAX_BLOCK_SIZE_OVERRIDES = {"name_full": 6000}
 DEFAULT_MIN_SCORE = 2
 DEFAULT_TOP_K = 25
 DEFAULT_BATCH_SIZE = 1000
@@ -42,7 +42,13 @@ def purge_common_keys(
     max_block_size: int = DEFAULT_MAX_BLOCK_SIZE,
     overrides: dict = None,
 ):
-    """Drop (key_type, key_value) pairs whose Source-2/3 frequency exceeds the cap.
+    """Drop (key_type, key_value, country) triples whose Source-2/3 frequency
+    exceeds the cap, WITHIN that country.
+
+    Frequency is computed per-country (not globally) because blocking joins
+    are country-scoped: a key that's extremely common in one country but rare
+    in another should only be purged where it's actually too common, not
+    globally deleted and lost for the country where it was still selective.
 
     `overrides` lets specific key_types (e.g. name_full) use a different cap
     than the default, since some key types carry much stronger match signal
@@ -54,13 +60,13 @@ def purge_common_keys(
     cur.execute(
         """
         CREATE TABLE key_freq AS
-        SELECT key_type, key_value, COUNT(*) AS freq
+        SELECT key_type, key_value, country, COUNT(*) AS freq
         FROM blocking_keys
         WHERE source IN (2, 3)
-        GROUP BY key_type, key_value
+        GROUP BY key_type, key_value, country
         """
     )
-    cur.execute("CREATE INDEX idx_key_freq ON key_freq(key_type, key_value);")
+    cur.execute("CREATE INDEX idx_key_freq ON key_freq(key_type, key_value, country);")
     before = cur.execute("SELECT COUNT(*) FROM blocking_keys").fetchone()[0]
 
     key_types = [r[0] for r in cur.execute("SELECT DISTINCT key_type FROM key_freq")]
@@ -70,8 +76,8 @@ def purge_common_keys(
             """
             DELETE FROM blocking_keys
             WHERE key_type = ?
-              AND (key_type, key_value) IN (
-                  SELECT key_type, key_value FROM key_freq WHERE key_type = ? AND freq > ?
+              AND (key_type, key_value, country) IN (
+                  SELECT key_type, key_value, country FROM key_freq WHERE key_type = ? AND freq > ?
               )
             """,
             (kt, kt, cap),
