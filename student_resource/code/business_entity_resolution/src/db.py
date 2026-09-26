@@ -195,11 +195,17 @@ def build_db(dataset_dir: str, db_path: str, split: str):
 
     build_indexes(conn)
 
-    # Document frequencies for IDF weighting. Nothing is deleted here — keys
-    # are weighted by rarity at query time instead of being purged, which is
+    # Document frequencies for IDF weighting. Nothing informative is deleted —
+    # keys are weighted by rarity at query time rather than purged, which is
     # what protects candidate-set recall (see blocking.py).
     import blocking as blocking_mod
     blocking_mod.build_key_stats(conn)
+    # Drop only keys so common that probing already refuses to touch them:
+    # recall-neutral by construction, but a large throughput win.
+    blocking_mod.prune_unprobeable_keys(conn)
+    # Materialize each Source-1 entity's probe keys so candidate generation is
+    # a single indexed join instead of per-batch Python work.
+    blocking_mod.build_probe_table(conn)
 
     conn.close()
     return counts
