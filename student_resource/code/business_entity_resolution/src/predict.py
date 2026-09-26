@@ -32,7 +32,8 @@ def load_model(models_dir):
     return booster, config
 
 
-def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None):
+def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None,
+        shard=0, num_shards=1):
     booster, config = load_model(models_dir)
     top_k = config["blocking_top_k"]
     min_score = config["blocking_min_score"]
@@ -87,9 +88,20 @@ def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None):
             cand_f.write(f"{s1}\t{','.join(cand_ids)}\n")
             match_f.write(f"{s1}\t{','.join(matched_ids)}\n")
 
+    # Sharding: each worker takes a disjoint slice of the Source-1 entities.
+    # The work is embarrassingly parallel (entities are independent) and the
+    # bottleneck is random disk I/O on one SQLite reader, so running N workers
+    # over the same read-only DB scales close to linearly.
+    shard_ids = None
+    if num_shards > 1:
+        all_ids = [r[0] for r in conn.execute("SELECT entity_id FROM source1")]
+        shard_ids = [e for i, e in enumerate(all_ids) if i % num_shards == shard]
+        print(f"  shard {shard}/{num_shards}: {len(shard_ids)} of {len(all_ids)} entities", flush=True)
+
     for s1_id, cands in blocking.generate_candidates(
         conn, top_k=top_k, min_score=min_score, probe_keys=probe_keys,
-        batch_size=blocking.DEFAULT_BATCH_SIZE, limit_s1=limit_s1, progress_every=0,
+        batch_size=blocking.DEFAULT_BATCH_SIZE, limit_s1=limit_s1,
+        s1_ids=shard_ids, progress_every=0,
     ):
         batch_results.append((s1_id, cands))
         n_entities += 1
@@ -116,6 +128,11 @@ if __name__ == "__main__":
     ap.add_argument("--candidate-out", required=True)
     ap.add_argument("--matching-out", required=True)
     ap.add_argument("--limit-s1", type=int, default=None)
+    ap.add_argument("--shard", type=int, default=0,
+                    help="This worker's index, 0-based (use with --num-shards).")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="Run N workers in parallel over disjoint entity slices, "
+                         "then merge with merge_shards.py.")
     args = ap.parse_args()
     run(args.db, args.models_dir, args.candidate_out, args.matching_out,
-        limit_s1=args.limit_s1)
+        limit_s1=args.limit_s1, shard=args.shard, num_shards=args.num_shards)

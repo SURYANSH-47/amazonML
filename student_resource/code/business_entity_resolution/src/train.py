@@ -26,8 +26,12 @@ import numpy as np
 
 SEED = 42
 VAL_FRACTION_HASH = 15  # entities with hash%100 < this go to validation
-TRAIN_FIT_SAMPLE_SIZE = 300_000
-VAL_SAMPLE_SIZE = 150_000
+# Sized for signal, not for scale: ~60k entities yields well over a million
+# labeled pairs, which is far more than a 23-feature GBDT needs to converge
+# (dev AUC is already ~0.999). Blocking throughput is the binding constraint,
+# so spending hours to featurize 300k entities buys nothing measurable.
+TRAIN_FIT_SAMPLE_SIZE = 60_000
+VAL_SAMPLE_SIZE = 30_000
 ENTITY_BATCH = 2000
 
 
