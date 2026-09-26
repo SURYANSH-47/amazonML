@@ -135,10 +135,20 @@ def _flush(cur, table, row_batch, key_batch):
 
 
 def build_indexes(conn):
-    print("  building indexes...", flush=True)
+    import time
     cur = conn.cursor()
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_bk_lookup ON blocking_keys(key_type, key_value, source);")
+    # country before source: every blocking join filters key_type+key_value+country
+    # together (see blocking.py), so this lets SQLite seek straight to the
+    # exact country-scoped block instead of scanning every country's rows for
+    # that key and filtering afterward. Matters much more now that blocks can
+    # be up to 2000-6000 rows (vs. 200-2000 before the purge fix).
+    t0 = time.time()
+    print("  building index idx_bk_lookup...", flush=True)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_bk_lookup ON blocking_keys(key_type, key_value, country, source);")
+    print(f"  idx_bk_lookup done in {time.time()-t0:.0f}s, building idx_bk_entity...", flush=True)
+    t1 = time.time()
     cur.execute("CREATE INDEX IF NOT EXISTS idx_bk_entity ON blocking_keys(source, entity_id);")
+    print(f"  idx_bk_entity done in {time.time()-t1:.0f}s", flush=True)
     conn.commit()
 
 

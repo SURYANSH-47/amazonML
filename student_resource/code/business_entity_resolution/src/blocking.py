@@ -56,6 +56,8 @@ def purge_common_keys(
     """
     overrides = overrides or {}
     cur = conn.cursor()
+    print("  purge: computing per-country key frequencies...", flush=True)
+    t0 = time.time()
     cur.execute("DROP TABLE IF EXISTS key_freq;")
     cur.execute(
         """
@@ -68,9 +70,11 @@ def purge_common_keys(
     )
     cur.execute("CREATE INDEX idx_key_freq ON key_freq(key_type, key_value, country);")
     before = cur.execute("SELECT COUNT(*) FROM blocking_keys").fetchone()[0]
+    print(f"  purge: key_freq built in {time.time()-t0:.0f}s, deleting over-cap keys...", flush=True)
 
     key_types = [r[0] for r in cur.execute("SELECT DISTINCT key_type FROM key_freq")]
     for kt in key_types:
+        t1 = time.time()
         cap = overrides.get(kt, max_block_size)
         cur.execute(
             """
@@ -82,11 +86,12 @@ def purge_common_keys(
             """,
             (kt, kt, cap),
         )
+        print(f"  purge: {kt} (cap={cap}) done in {time.time()-t1:.0f}s", flush=True)
     conn.commit()
     after = cur.execute("SELECT COUNT(*) FROM blocking_keys").fetchone()[0]
     cur.execute("DROP TABLE key_freq;")
     conn.commit()
-    print(f"  block purging: {before} -> {after} blocking_keys rows (max_block_size={max_block_size}, overrides={overrides})", flush=True)
+    print(f"  block purging: {before} -> {after} blocking_keys rows (max_block_size={max_block_size}, overrides={overrides}), total {time.time()-t0:.0f}s", flush=True)
 
 
 def _score_expr():
