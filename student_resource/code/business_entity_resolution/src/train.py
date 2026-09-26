@@ -36,15 +36,15 @@ def stable_bucket(entity_id: str) -> int:
     return int(h[:8], 16) % 100
 
 
-def split_entities(conn):
+def split_entities(conn, fit_size=TRAIN_FIT_SAMPLE_SIZE, val_size=VAL_SAMPLE_SIZE):
     all_ids = [r[0] for r in conn.execute("SELECT entity_id FROM source1")]
     val_ids = [i for i in all_ids if stable_bucket(i) < VAL_FRACTION_HASH]
     fit_ids = [i for i in all_ids if stable_bucket(i) >= VAL_FRACTION_HASH]
     rng = random.Random(SEED)
     rng.shuffle(fit_ids)
     rng.shuffle(val_ids)
-    fit_sample = fit_ids[:TRAIN_FIT_SAMPLE_SIZE]
-    val_sample = val_ids[:VAL_SAMPLE_SIZE]
+    fit_sample = fit_ids[:fit_size]
+    val_sample = val_ids[:val_size]
     print(f"  total S1 entities: {len(all_ids)}, fit_sample: {len(fit_sample)}, val_sample: {len(val_sample)}", flush=True)
     return fit_sample, val_sample
 
@@ -61,7 +61,8 @@ def load_ground_truth_subset(gt_path, needed_ids: set):
     return gt
 
 
-def build_pairs(conn, s1_ids, gt, top_k, min_score, batch_size, label=True):
+def build_pairs(conn, s1_ids, gt, top_k, min_score, batch_size, label=True,
+                probe_keys=None):
     """Stream blocking candidates for s1_ids, featurize in entity-batches.
 
     Returns X (list[list[float]]), y (list[int] or None), s1_out, cand_out.
@@ -84,7 +85,8 @@ def build_pairs(conn, s1_ids, gt, top_k, min_score, batch_size, label=True):
 
     for s1_id, cands in blocking.generate_candidates(
         conn, top_k=top_k, min_score=min_score, batch_size=batch_size,
-        s1_ids=s1_ids, progress_every=0,
+        s1_ids=s1_ids, probe_keys=probe_keys or blocking.PROBE_KEYS,
+        progress_every=0,
     ):
         if cands:
             batch_results.append((s1_id, cands))
@@ -165,27 +167,33 @@ def main():
     ap.add_argument("--ground-truth", required=True)
     ap.add_argument("--models-dir", required=True)
     ap.add_argument("--top-k", type=int, default=blocking.DEFAULT_TOP_K)
-    ap.add_argument("--min-score", type=int, default=blocking.DEFAULT_MIN_SCORE)
-    ap.add_argument("--max-block-size", type=int, default=blocking.DEFAULT_MAX_BLOCK_SIZE)
+    ap.add_argument("--min-score", type=float, default=blocking.DEFAULT_MIN_SCORE)
+    ap.add_argument("--probe-keys", type=int, default=blocking.PROBE_KEYS)
     ap.add_argument("--batch-size", type=int, default=blocking.DEFAULT_BATCH_SIZE)
-    ap.add_argument("--skip-purge", action="store_true")
+    ap.add_argument("--rebuild-stats", action="store_true",
+                    help="Recompute key_freq before training (db.py already builds it).")
+    ap.add_argument("--fit-sample", type=int, default=TRAIN_FIT_SAMPLE_SIZE,
+                    help="Source-1 entities used to build training pairs.")
+    ap.add_argument("--val-sample", type=int, default=VAL_SAMPLE_SIZE,
+                    help="Held-out Source-1 entities for threshold tuning.")
     args = ap.parse_args()
 
     from db import connect as db_connect
 
     conn = db_connect(args.db)
 
-    if not args.skip_purge:
-        blocking.purge_common_keys(conn, args.max_block_size, blocking.DEFAULT_MAX_BLOCK_SIZE_OVERRIDES)
+    if args.rebuild_stats:
+        blocking.build_key_stats(conn)
 
-    fit_sample, val_sample = split_entities(conn)
+    fit_sample, val_sample = split_entities(conn, args.fit_sample, args.val_sample)
     needed = set(fit_sample) | set(val_sample)
     print("  loading ground truth subset...", flush=True)
     gt = load_ground_truth_subset(args.ground_truth, needed)
 
     print("  building training pairs...", flush=True)
     X, y, s1_out, cand_out = build_pairs(
-        conn, fit_sample, gt, args.top_k, args.min_score, args.batch_size, label=True
+        conn, fit_sample, gt, args.top_k, args.min_score, args.batch_size,
+        label=True, probe_keys=args.probe_keys,
     )
     pos_rate = sum(y) / len(y) if y else 0.0
     print(f"  training pairs: {len(X)} (positive rate={pos_rate:.3f})", flush=True)
@@ -195,13 +203,22 @@ def main():
 
     print("  building validation pairs...", flush=True)
     Xv, _, s1v, candv = build_pairs(
-        conn, val_sample, gt, args.top_k, args.min_score, args.batch_size, label=False
+        conn, val_sample, gt, args.top_k, args.min_score, args.batch_size,
+        label=False, probe_keys=args.probe_keys,
     )
     probs = booster.predict(np.asarray(Xv, dtype=np.float32))
     by_entity = group_by_entity(s1v, candv, probs)
 
-    thresholds = [round(t, 2) for t in np.arange(0.10, 0.91, 0.05)]
-    top_ns = [None, 3, 5, 8, 12, 20]
+    # F_0.5 weights precision 2x, so the optimum often sits at a high
+    # threshold — the grid deliberately extends to 0.99 and is fine-grained at
+    # the top end. An earlier grid capped at 0.90 and could not even express
+    # the precision-heavy operating points this metric rewards.
+    thresholds = [round(float(t), 3) for t in np.concatenate([
+        np.arange(0.10, 0.80, 0.05),
+        np.arange(0.80, 0.99, 0.01),
+        [0.99, 0.995],
+    ])]
+    top_ns = [None, 2, 3, 4, 5, 6, 8, 10, 12, 20]
     best_result, best_thr, best_top_n = tune_threshold(by_entity, val_sample, gt, thresholds, top_ns)
     print(f"  BEST validation macro F0.5={best_result['macro_f0.5']:.4f} "
           f"(precision={best_result['mean_precision']:.4f}, recall={best_result['mean_recall']:.4f}) "
@@ -226,7 +243,7 @@ def main():
             "feature_names": feat_mod.FEATURE_NAMES,
             "blocking_top_k": args.top_k,
             "blocking_min_score": args.min_score,
-            "blocking_max_block_size": args.max_block_size,
+            "blocking_probe_keys": args.probe_keys,
             "validation_macro_f0.5": best_result["macro_f0.5"],
             "validation_precision": best_result["mean_precision"],
             "validation_recall": best_result["mean_recall"],

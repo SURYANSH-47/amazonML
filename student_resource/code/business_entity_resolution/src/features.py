@@ -10,7 +10,15 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(__file__))
-from normalize import addr_tokens, digit_tokens, name_tokens
+from normalize import (
+    addr_tokens,
+    digit_tokens,
+    name_phonetic,
+    name_sorted_key,
+    name_tokens,
+    phonetic_tokens,
+    postal_tokens,
+)
 
 from rapidfuzz import fuzz
 
@@ -32,6 +40,15 @@ FEATURE_NAMES = [
     "addr_digit_jaccard",
     "s1_addr_empty",
     "cand_addr_empty",
+    # Added alongside the meta-blocking rewrite: these capture the signals the
+    # new blocking key types are built on, so the model can weigh them directly
+    # rather than only seeing their aggregate in blocking_score.
+    "name_sorted_exact",
+    "name_phon_exact",
+    "phon_token_jaccard",
+    "postal_exact",
+    "n_shared_name_tokens",
+    "n_shared_addr_tokens",
 ]
 
 
@@ -110,6 +127,11 @@ def compute_features(s1_name_norm, s1_addr_norm, s1_raw_addr,
     prefix1 = s1_name_norm.replace(" ", "")[:4]
     prefix2 = cand_name_norm.replace(" ", "")[:4]
 
+    sorted1, sorted2 = name_sorted_key(s1_name_norm), name_sorted_key(cand_name_norm)
+    phon1, phon2 = name_phonetic(s1_name_norm), name_phonetic(cand_name_norm)
+    pt1, pt2 = phonetic_tokens(s1_name_norm), phonetic_tokens(cand_name_norm)
+    post1, post2 = postal_tokens(s1_raw_addr), postal_tokens(cand_raw_addr)
+
     return [
         float(blocking_score),
         float(cand_source),
@@ -128,4 +150,10 @@ def compute_features(s1_name_norm, s1_addr_norm, s1_raw_addr,
         _jaccard(dt1, dt2),
         1.0 if not s1_addr_norm else 0.0,
         1.0 if not cand_addr_norm else 0.0,
+        1.0 if (sorted1 and sorted1 == sorted2) else 0.0,
+        1.0 if (phon1 and phon1 == phon2) else 0.0,
+        _jaccard(pt1, pt2),
+        1.0 if (post1 & post2) else 0.0,
+        float(len(nt1 & nt2)),
+        float(len(at1 & at2)),
     ]

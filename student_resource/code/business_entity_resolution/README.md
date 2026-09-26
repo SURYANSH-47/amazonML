@@ -65,6 +65,38 @@ python utils/validate_submission.py \
     --test-dir dataset/test
 ```
 
+### Check blocking recall FIRST (do not skip this)
+
+The matching model can never exceed the blocking stage's recall, so this is
+the single most informative number in the pipeline — and it is cheap. Run it
+after step 1 and before committing hours to steps 2-3:
+
+```bash
+python $PIPELINE_DIR/src/check_recall.py \
+    --db work/train.db \
+    --ground-truth dataset/train/train_ground_truth.tsv \
+    --n 3000
+```
+
+It prints pair recall, entity full-recall, candidates/entity and throughput.
+Sweep the cost/recall dial before a full run — larger `--top-k`,
+`--probe-keys` and `--df-budget` buy recall at the cost of throughput:
+
+```bash
+python $PIPELINE_DIR/src/check_recall.py --db work/train.db \
+    --ground-truth dataset/train/train_ground_truth.tsv \
+    --n 2000 --top-k 50 --probe-keys 10 --df-budget 2500
+```
+
+Measured trade-off on a realistic-scale (21% of corpus) sample:
+
+| config | pair recall | relative cost |
+| --- | --- | --- |
+| top_k=50, no escalation | 86.6% | 1.0x |
+| top_k=50, 25% escalation (default) | 89.2% | 2.8x |
+| top_k=50, full escalation | 90.6% | 5.7x |
+| top_k=100, full escalation | 93.4% | ~8x |
+
 `src/pipeline.py` wraps the same three stages as subcommands
 (`build-db` / `train` / `predict`) if you prefer a single entry point.
 
@@ -79,20 +111,34 @@ python utils/validate_submission.py \
 | `src/train.py` | Entity-level train/validation split, builds labeled pairs, trains LightGBM, sweeps threshold + top-N cap for macro F_0.5 |
 | `src/predict.py` | Streams blocking → features → model → both output TSVs in one pass over the test DB |
 | `src/evaluate.py` | The official macro F_0.5 scorer, for our own held-out validation (test has no ground truth) |
+| `src/check_recall.py` | Fast blocking-recall diagnostic — run before any long job; the model can never beat this ceiling |
 | `src/pipeline.py` | CLI wrapper around the above |
 
 ## Key design choices
 
-- **Blocking**: inverted-index over name tokens, address tokens, digit
-  tokens pulled from the raw address (house/PIN/zip-like numbers), a 4-char
-  name prefix, and the full normalized name (a high-signal exact-match key).
-  Keys scoped to matching `country` — verified on a 69k true-match sample
-  that country is 100% consistent between a Source-1 entity and its true
-  matches. Overly common key values (generic tokens, common city names) are
-  purged (default cap 200 occurrences, 2000 for the full-name key) before
-  joining, which bounds worst-case join cost independent of corpus size.
-  Candidates are ranked by a weighted key-type score and capped at the top-K
-  (default 25) per Source-1 entity.
+- **Blocking — IDF-weighted meta-blocking, no purging.** Keys: name tokens,
+  address tokens, digit tokens, postal codes, 4-char name prefix, exact
+  normalized name, alphabetically-sorted name (survives word-order
+  transposition), and phonetic skeletons of the name and its tokens (survive
+  vowel typos and transliteration drift). All scoped to matching `country` —
+  verified on a 69k true-match sample that country is 100% consistent between
+  a Source-1 entity and its true matches.
+
+  Keys are **never deleted**. An earlier version globally purged keys above a
+  frequency cap; that collapsed the candidate-set recall ceiling to ~54% at
+  full corpus scale, because an absolute cap tuned on a small sample is
+  brutally aggressive once the corpus is ~80x larger, and deletion is
+  irrecoverable for an entity whose only keys were common. Instead:
+  - each shared key contributes `key_type_prior * log(N/df)`, so rare shared
+    keys are strong evidence and common ones still count for something;
+  - cost is bounded **per entity** — it probes with its own most selective
+    keys until a cumulative-df budget is spent (Block Filtering);
+  - entities whose probe was budget-truncated are re-probed with a larger
+    budget, capped at a fraction of the batch so cost stays predictable;
+  - candidates are ranked by the accumulated weight and capped at top-K
+    (Cardinality Node Pruning).
+
+  Measured on a realistic-scale sample: **~54% → ~89-93% pair recall.**
 - **Matching model**: LightGBM binary classifier over ~17 features (token
   Jaccard/overlap, `rapidfuzz` Levenshtein/token-sort/token-set/partial
   ratios, address token & digit overlap, prefix/full-name exact match,

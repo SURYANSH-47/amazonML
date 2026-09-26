@@ -32,21 +32,17 @@ def load_model(models_dir):
     return booster, config
 
 
-def run(db_path, models_dir, candidate_out, matching_out,
-        max_block_size=None, skip_purge=False, limit_s1=None):
+def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None):
     booster, config = load_model(models_dir)
     top_k = config["blocking_top_k"]
     min_score = config["blocking_min_score"]
-    mbs = max_block_size if max_block_size is not None else config["blocking_max_block_size"]
+    probe_keys = config.get("blocking_probe_keys", blocking.PROBE_KEYS)
     threshold = config["threshold"]
     top_n = config["top_n"]
 
     from db import connect as db_connect
 
     conn = db_connect(db_path)
-
-    if not skip_purge:
-        blocking.purge_common_keys(conn, mbs, blocking.DEFAULT_MAX_BLOCK_SIZE_OVERRIDES)
 
     cand_f = open(candidate_out, "w", encoding="utf-8", newline="")
     match_f = open(matching_out, "w", encoding="utf-8", newline="")
@@ -92,8 +88,8 @@ def run(db_path, models_dir, candidate_out, matching_out,
             match_f.write(f"{s1}\t{','.join(matched_ids)}\n")
 
     for s1_id, cands in blocking.generate_candidates(
-        conn, top_k=top_k, min_score=min_score, batch_size=blocking.DEFAULT_BATCH_SIZE,
-        limit_s1=limit_s1, progress_every=0,
+        conn, top_k=top_k, min_score=min_score, probe_keys=probe_keys,
+        batch_size=blocking.DEFAULT_BATCH_SIZE, limit_s1=limit_s1, progress_every=0,
     ):
         batch_results.append((s1_id, cands))
         n_entities += 1
@@ -120,7 +116,6 @@ if __name__ == "__main__":
     ap.add_argument("--candidate-out", required=True)
     ap.add_argument("--matching-out", required=True)
     ap.add_argument("--limit-s1", type=int, default=None)
-    ap.add_argument("--skip-purge", action="store_true")
     args = ap.parse_args()
     run(args.db, args.models_dir, args.candidate_out, args.matching_out,
-        skip_purge=args.skip_purge, limit_s1=args.limit_s1)
+        limit_s1=args.limit_s1)

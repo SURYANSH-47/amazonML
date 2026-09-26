@@ -14,10 +14,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 from normalize import (
     addr_tokens,
     digit_tokens,
+    name_phonetic,
     name_prefix,
+    name_sorted_key,
     name_tokens,
     normalize_address,
     normalize_name,
+    phonetic_tokens,
+    postal_tokens,
 )
 
 BATCH_SIZE = 5000
@@ -70,21 +74,40 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 
 def _row_keys(source_num, entity_id, country, name_norm, addr_norm, raw_address):
+    """Emit every blocking key for a record.
+
+    Deliberately generous: keys are never deleted downstream (see blocking.py),
+    they are only weighted by how rare they are, so an extra key type can add
+    recall without the old risk of flooding the candidate set.
+    """
     keys = []
+    add = keys.append
     for tok in name_tokens(name_norm):
-        keys.append((source_num, entity_id, country, "name_token", tok))
+        add((source_num, entity_id, country, "name_token", tok))
     for tok in addr_tokens(addr_norm):
-        keys.append((source_num, entity_id, country, "addr_token", tok))
+        add((source_num, entity_id, country, "addr_token", tok))
     for d in digit_tokens(raw_address):
-        keys.append((source_num, entity_id, country, "digit_token", d))
+        add((source_num, entity_id, country, "digit_token", d))
+    # Postal codes are far more discriminative than generic house numbers.
+    for p in postal_tokens(raw_address):
+        add((source_num, entity_id, country, "postal_token", p))
     prefix = name_prefix(name_norm)
     if len(prefix) >= 3:
-        keys.append((source_num, entity_id, country, "name_prefix", prefix))
-    # Exact-normalized-name key: strong signal even when tokens individually
-    # are common (e.g. "urology specialists") and address is missing/sparse.
-    # Purged with a much higher cap than the per-token keys (see blocking.py).
+        add((source_num, entity_id, country, "name_prefix", prefix))
     if name_norm:
-        keys.append((source_num, entity_id, country, "name_full", name_norm))
+        # Exact whole-name match: the single strongest lexical signal.
+        add((source_num, entity_id, country, "name_full", name_norm))
+        # Order-independent name: survives word-order transposition.
+        sorted_key = name_sorted_key(name_norm)
+        if sorted_key and sorted_key != name_norm:
+            add((source_num, entity_id, country, "name_sorted", sorted_key))
+        # Phonetic skeletons: survive vowel typos and transliteration drift,
+        # which is how many Source-2/3 India records differ from Source 1.
+        phon = name_phonetic(name_norm)
+        if len(phon) >= 3:
+            add((source_num, entity_id, country, "name_phon", phon))
+        for pt in phonetic_tokens(name_norm):
+            add((source_num, entity_id, country, "phon_token", pt))
     return keys
 
 
@@ -170,13 +193,14 @@ def build_db(dataset_dir: str, db_path: str, split: str):
     counts[2] = load_source(conn, os.path.join(split_dir, f"{split}_source2.tsv"), 2)
     counts[3] = load_source(conn, os.path.join(split_dir, f"{split}_source3.tsv"), 3)
 
-    # Purge overly common blocking keys BEFORE indexing: the raw blocking_keys
-    # table can be 100M+ rows, so indexing it unpurged is a much larger (and,
-    # on this machine, RAM-riskier) sort than indexing the purged table.
-    import blocking as blocking_mod
-    blocking_mod.purge_common_keys(conn, blocking_mod.DEFAULT_MAX_BLOCK_SIZE, blocking_mod.DEFAULT_MAX_BLOCK_SIZE_OVERRIDES)
-
     build_indexes(conn)
+
+    # Document frequencies for IDF weighting. Nothing is deleted here — keys
+    # are weighted by rarity at query time instead of being purged, which is
+    # what protects candidate-set recall (see blocking.py).
+    import blocking as blocking_mod
+    blocking_mod.build_key_stats(conn)
+
     conn.close()
     return counts
 
