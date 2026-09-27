@@ -12,7 +12,7 @@ import collections
 import sys
 
 
-def main(path, write_entities=None):
+def main(path, write_entities=None, include_empty=False):
     claims = collections.Counter()
     n_rows = n_nonempty = n_matches = 0
     with open(path, encoding="utf-8") as f:
@@ -30,13 +30,20 @@ def main(path, write_entities=None):
     contested = {k: v for k, v in claims.items() if v > 1}
     excess = sum(v - 1 for v in contested.values())
     hit_ids = []
+    n_empty = 0
     with open(path, encoding="utf-8") as f:
         next(f)
         for line in f:
             s1, _, rest = line.rstrip("\n").partition("\t")
             if rest and any(i in contested for i in rest.split(",")):
                 hit_ids.append(s1)
-    entities_hit = len(hit_ids)
+            elif not rest:
+                n_empty += 1
+                if include_empty:
+                    hit_ids.append(s1)
+    entities_hit = len(hit_ids) - (n_empty if include_empty else 0)
+    print(f"entities predicted empty: {n_empty}"
+          + (" (included in the re-score list)" if include_empty else ""))
     if write_entities:
         # Every claimant of a contested record is in this list by definition,
         # so re-scoring exactly these entities gives the full information
@@ -45,7 +52,9 @@ def main(path, write_entities=None):
             f.write("source1_entity_id\n")
             for e in hit_ids:
                 f.write(e + "\n")
-        print(f"wrote {entities_hit} conflicted entity ids to {write_entities}")
+        print(f"wrote {len(hit_ids)} entity ids to {write_entities} "
+              f"({entities_hit} conflicted"
+              + (f" + {n_empty} empty)" if include_empty else ")"))
 
     print(f"rows: {n_rows}, entities with matches: {n_nonempty}, total matches: {n_matches}")
     print(f"records claimed by >1 entity: {len(contested)}")
@@ -63,5 +72,8 @@ if __name__ == "__main__":
     ap.add_argument("path", nargs="?", default="output/matching_results.tsv")
     ap.add_argument("--write-entities", default=None,
                     help="Write the ids of every entity touched by a conflict here.")
+    ap.add_argument("--include-empty", action="store_true",
+                    help="Also list entities predicted empty, so a fallback rule can "
+                         "re-decide them in the same targeted re-score.")
     args = ap.parse_args()
-    main(args.path, args.write_entities)
+    main(args.path, args.write_entities, args.include_empty)
