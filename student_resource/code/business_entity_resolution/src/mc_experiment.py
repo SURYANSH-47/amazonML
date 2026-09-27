@@ -571,9 +571,61 @@ CTX_FEATURES = ["p1", "p1_rank", "p1_rel", "p1_gap_other",
                 "ent_cands", "ent_n_hi", "ent_sum"]
 
 
-def context_features(group, p1):
+CTX_EXTRA = ["src_rank", "amb_count",
+             "addr_tset_gap", "addr_tset_rank", "name_tset_gap", "name_tset_rank",
+             "addr_ovl_gap", "phon_gap"]
+
+
+def _group_rank_max(group, val):
+    """Rank (1 = highest) of each value within its group, and the group max."""
+    n = len(val)
+    order = np.lexsort((-val, group))
+    gs, vs = group[order], val[order]
+    starts = np.r_[0, np.nonzero(gs[1:] != gs[:-1])[0] + 1]
+    sizes = np.diff(np.r_[starts, n])
+    rank_s = np.arange(n) - np.repeat(starts, sizes) + 1
+    mx_s = np.repeat(vs[starts], sizes)
+    inv = np.empty(n, np.int64)
+    inv[order] = np.arange(n)
+    return rank_s[inv].astype(np.float32), mx_s[inv].astype(np.float32)
+
+
+def context_extra(group, p1, F):
+    """How this candidate compares to its rivals on the raw evidence, not just
+    the model score, and within its own source: a business typically has 1-3
+    matches in Source 2 AND 1-3 in Source 3, so 'best Source-3 candidate' is
+    meaningful even when a Source-2 candidate outranks it overall."""
+    col = {f: j for j, f in enumerate(FEATURES)}
+    group = np.asarray(group, np.int64)
+    p1 = np.asarray(p1, np.float32)
+    src = F[:, col["cand_source"]].astype(np.int64)
+    src_rank, _ = _group_rank_max(group * 4 + src, p1)
+    _, top = _group_rank_max(group, p1)
+    near = (p1 >= top - 0.1).astype(np.float32)
+    _, g = np.unique(group, return_inverse=True)
+    amb = np.bincount(g, weights=near)[g].astype(np.float32)
+    out = [src_rank, amb]
+    for fname, want_rank in (("r_addr_tset", True), ("r_name_tset", True),
+                             ("addr_word_ovl", False), ("r_phon", False)):
+        v = F[:, col[fname]]
+        rk, mx = _group_rank_max(group, v)
+        out.append(mx - v)
+        if want_rank:
+            out.append(rk)
+    return np.column_stack(out).astype(np.float32)
+
+
+def context_features(group, p1, F=None, extra=False):
     """Per-pair features comparing p1 to the other candidates of the same
-    entity. group: int entity code per pair; p1: stage-1 probabilities."""
+    entity. group: int entity code per pair; p1: stage-1 probabilities.
+    extra=True appends context_extra (needs F)."""
+    base = _context_base(group, p1)
+    if extra:
+        return np.hstack([base, context_extra(group, p1, F)])
+    return base
+
+
+def _context_base(group, p1):
     n = len(p1)
     if n == 0:
         return np.zeros((0, len(CTX_FEATURES)), np.float32)
@@ -639,6 +691,12 @@ def main():
     ap.add_argument("--db", default=None, help="Enable channel c1 using this SQLite DB.")
     ap.add_argument("--c1-topk", type=int, default=100)
     ap.add_argument("--max-df", type=float, default=0.02)
+    ap.add_argument("--cache-dir", default=None,
+                    help="Where union_features.npz lives (default <out-dir>/cache).")
+    ap.add_argument("--ctx-extra", action="store_true",
+                    help="Stage 2 also compares raw evidence and per-source rank to rivals.")
+    ap.add_argument("--lr", type=float, default=0.05)
+    ap.add_argument("--leaves", type=int, default=127)
     ap.add_argument("--from-cache", action="store_true",
                     help="Reuse cached union+features; only retrain/re-evaluate the reranker.")
     args = ap.parse_args()
@@ -656,7 +714,9 @@ def main():
     gt = load_gt(os.path.join(split_dir, f"{args.split}_ground_truth.tsv"), want)
     log(f"val {len(val)}, fit {len(fit)}, channels {sorted(args.channels)}")
 
-    cache = os.path.join(args.out_dir, "cache", "union_features.npz")
+    LGB_PARAMS.update(learning_rate=args.lr, num_leaves=args.leaves)
+    cache = os.path.join(args.cache_dir or os.path.join(args.out_dir, "cache"),
+                         "union_features.npz")
     if args.from_cache and os.path.exists(cache):
         z = np.load(cache, allow_pickle=True)
         s1, cand, F = z["s1"], z["cand"], z["F"]
@@ -738,8 +798,9 @@ def main():
     best1 = final_report(val, gt, per1)
 
     t2 = time.time()
-    F2 = np.hstack([F, context_features(codes, p1)])
-    m2 = train_lgb(F2[fit_m], y[fit_m], FEATURES + CTX_FEATURES)
+    ctx_names = CTX_FEATURES + (CTX_EXTRA if args.ctx_extra else [])
+    F2 = np.hstack([F, context_features(codes, p1, F, args.ctx_extra)])
+    m2 = train_lgb(F2[fit_m], y[fit_m], FEATURES + ctx_names)
     p2 = m2.predict(F2[is_val], num_iteration=m2.best_iteration)
     log(f"\nstage 2: {m2.best_iteration} rounds ({time.time()-t2:.0f}s)")
     per2 = scored_lists(s1[is_val], cand[is_val], p2, val)
@@ -751,12 +812,13 @@ def main():
     m1.save_model(os.path.join(args.out_dir, "mc_m1.txt"), num_iteration=m1.best_iteration)
     m2.save_model(os.path.join(args.out_dir, "mc_m2.txt"), num_iteration=m2.best_iteration)
     mb = m2 if two_stage else m1
-    names = FEATURES + CTX_FEATURES if two_stage else FEATURES
+    names = FEATURES + ctx_names if two_stage else FEATURES
     imp = sorted(zip(names, mb.feature_importance("gain")), key=lambda x: -x[1])
     with open(os.path.join(args.out_dir, "mc_report.json"), "w") as f:
         json.dump({"best_f05": best[0], "best_precision": best[1], "best_recall": best[2],
                    "best_config": best[3], "two_stage": bool(two_stage),
                    "stage1_f05": best1[0], "stage2_f05": best2[0],
+                   "ctx_extra": bool(args.ctx_extra), "lr": args.lr, "leaves": args.leaves,
                    "features": FEATURES, "ctx_features": CTX_FEATURES,
                    "importance": [(k, float(v)) for k, v in imp],
                    "channels": sorted(c for c in args.channels if c != "c1"),

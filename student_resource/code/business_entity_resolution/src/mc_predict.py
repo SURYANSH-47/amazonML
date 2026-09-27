@@ -56,14 +56,14 @@ def make_decider(rule, kv):
     return decide
 
 
-def score_pairs(models, F, qi_a):
+def score_pairs(models, F, qi_a, ctx_extra=False):
     """Stage-1 score, plus stage 2 over rival-candidate context if enabled.
     Chunks are whole queries, so every candidate of an entity is present when
     its context features are computed — same as in validation."""
     m1, m2 = models
     p = m1.predict(F)
     if m2 is not None:
-        p = m2.predict(np.hstack([F, mc.context_features(qi_a, p)]))
+        p = m2.predict(np.hstack([F, mc.context_features(qi_a, p, F, ctx_extra)]))
     return p
 
 
@@ -96,7 +96,7 @@ def run_country(country, q_ids, s1rec, args, models, rule, kv, channels, max_df)
             by_q = defaultdict(list)
             if len(qi_a):
                 F = mc.pair_features(Q, T, qi_a, ti_a, chan, wm)
-                p = score_pairs(models, F, qi_a)
+                p = score_pairs(models, F, qi_a, args.ctx_extra)
                 del F
                 for q, t, pr in zip(qi_a, ti_a, p):
                     by_q[q].append((float(pr), t))
@@ -207,6 +207,7 @@ def main():
         rep = json.load(f)
     mc.TOPK.update(rep["topk"])
     mc.QKEEP.update(rep.get("qkeep", {}))
+    args.ctx_extra = bool(rep.get("ctx_extra", False))
     channels = set(rep["channels"]) - {"c1"}
     max_df = rep["max_df"]
     rule, kv = parse_config(args.config or rep["best_config"])
