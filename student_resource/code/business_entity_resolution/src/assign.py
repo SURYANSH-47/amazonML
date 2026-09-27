@@ -286,6 +286,8 @@ def cmd_patch(args):
 
     if args.rule == "fallback":
         decide = lambda ps: decide_fallback(ps, args.thr, args.lo, args.top_n)
+    elif args.rule == "expf":
+        decide = lambda ps: decide_expf(ps, args.r, args.s, args.floor)
     else:
         decide = lambda ps: decide_thresh(ps, args.thr, args.top_n)
 
@@ -338,7 +340,10 @@ def main():
     pt.add_argument("--rescored", required=True,
                     help="Glob of files listing the re-scored entity ids.")
     pt.add_argument("--out", required=True)
-    pt.add_argument("--rule", choices=["thresh", "fallback"], default="thresh")
+    pt.add_argument("--rule", choices=["thresh", "fallback", "expf"], default="thresh")
+    pt.add_argument("--r", type=float, default=0.75, help="expf: assumed blocking recall.")
+    pt.add_argument("--s", type=float, default=1.0, help="expf: singleton prior weight.")
+    pt.add_argument("--floor", type=float, default=0.05, help="expf: ignore probs below this.")
     pt.add_argument("--thr", type=float, default=0.6,
                     help="Main threshold (thr_hi for fallback). Keep equal to the "
                          "base run's threshold unless re-scoring every entity.")
