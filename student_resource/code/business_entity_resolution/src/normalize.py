@@ -137,6 +137,28 @@ def postal_tokens(text: str) -> set:
     return {d for d in _DIGIT_RE.findall(text) if len(d) in (5, 6)}
 
 
+_HOUSE_SEP_RE = re.compile(r"\s*([-/])\s*")
+_HOUSE_RE = re.compile(r"[a-z0-9]+(?:[-/][a-z0-9]+)+")
+
+
+def house_tokens(raw_address: str) -> set:
+    """Compound house/plot/door numbers kept whole: '6-3-10/3', '23-12-22',
+    '10/1102', 'c-44', 'd-70', '16-11-23/37/a'.
+
+    These are the most distinctive field in Indian addresses and survive
+    nearly every perturbation in the data (component reordering, state
+    abbreviation, native-script state names). The general normalizer strips
+    '-' and '/', which shreds '6-3-10/3' into the generic '10' and
+    '23-12-22' into '23','12','22' — numbers shared by thousands of records.
+    """
+    if not raw_address:
+        return set()
+    t = strip_accents_and_transliterate(raw_address).lower().replace("#", "")
+    t = _HOUSE_SEP_RE.sub(r"\1", t)
+    return {m for m in _HOUSE_RE.findall(t)
+            if any(ch.isdigit() for ch in m) and len(m) >= 3}
+
+
 def name_prefix(name_norm: str, length: int = 4) -> str:
     compact = name_norm.replace(" ", "")
     return compact[:length]

@@ -330,9 +330,43 @@ def cmd_patch(args):
           flush=True)
 
 
+def cmd_patch_cands(args):
+    """Replace candidate rows for re-scored entities.
+
+    Required when re-scoring used a larger --top-k: the submission rule is
+    that candidate_pairs.tsv is exactly the set fed to the model, and every
+    matched id must appear in it.
+    """
+    new_rows = {}
+    for p in sorted(glob.glob(args.rescored_cands)):
+        with open(p, encoding="utf-8") as f:
+            f.readline()
+            for line in f:
+                s1 = line.split("\t", 1)[0]
+                new_rows[s1] = line if line.endswith("\n") else line + "\n"
+    n = n_rep = 0
+    with open(args.base, encoding="utf-8") as fin, \
+         open(args.out, "w", encoding="utf-8", newline="") as fout:
+        fout.write(fin.readline())
+        for line in fin:
+            n += 1
+            s1 = line.split("\t", 1)[0]
+            if s1 in new_rows:
+                fout.write(new_rows[s1])
+                n_rep += 1
+            else:
+                fout.write(line if line.endswith("\n") else line + "\n")
+    print(f"  {n} candidate rows written to {args.out}; {n_rep} replaced", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    pc = sub.add_parser("patch-cands", help="Replace candidate rows for re-scored entities.")
+    pc.add_argument("--base", required=True, help="Existing candidate_pairs.tsv.")
+    pc.add_argument("--rescored-cands", required=True, help="Glob of re-scored candidate files.")
+    pc.add_argument("--out", required=True)
 
     pt = sub.add_parser("patch", help="Resolve conflicts in an existing submission.")
     pt.add_argument("--base", required=True, help="Existing matching_results.tsv.")
@@ -370,7 +404,8 @@ def main():
     a.add_argument("--floor", type=float, default=0.1)
 
     args = ap.parse_args()
-    {"tune": cmd_tune, "apply": cmd_apply, "patch": cmd_patch}[args.cmd](args)
+    {"tune": cmd_tune, "apply": cmd_apply, "patch": cmd_patch,
+     "patch-cands": cmd_patch_cands}[args.cmd](args)
 
 
 if __name__ == "__main__":

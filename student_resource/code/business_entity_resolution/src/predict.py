@@ -34,7 +34,7 @@ def load_model(models_dir):
 
 def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None,
         shard=0, num_shards=1, scores_out=None, score_floor=0.05, select="all",
-        s1_list=None):
+        s1_list=None, top_k_override=None):
     """scores_out: if set, also write every scored pair (s1, cand, prob) with
     prob >= score_floor. This moves all final decisions (thresholds, one-owner
     enforcement across entities) to assign.py, which runs in minutes — so the
@@ -44,7 +44,11 @@ def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None,
     in training), for producing labeled score dumps on train.db.
     """
     booster, config = load_model(models_dir)
-    top_k = config["blocking_top_k"]
+    # top_k can be raised at inference: the blocking join already computes
+    # every candidate before truncation, so a larger cap costs featurization
+    # time only. Useful for re-scoring entities that came out empty, whose
+    # true matches are often ranked just past the training-time cap.
+    top_k = top_k_override or config["blocking_top_k"]
     min_score = config["blocking_min_score"]
     probe_keys = config.get("blocking_probe_keys", blocking.PROBE_KEYS)
     threshold = config["threshold"]
@@ -172,8 +176,10 @@ if __name__ == "__main__":
     ap.add_argument("--s1-list", default=None,
                     help="Only process the Source-1 ids in this file (one per line, "
                          "with a header), e.g. the output of conflicts.py --write-entities.")
+    ap.add_argument("--top-k", type=int, default=None,
+                    help="Override the model config's candidate cap (inference only).")
     args = ap.parse_args()
     run(args.db, args.models_dir, args.candidate_out, args.matching_out,
         limit_s1=args.limit_s1, shard=args.shard, num_shards=args.num_shards,
         scores_out=args.scores_out, score_floor=args.score_floor, select=args.select,
-        s1_list=args.s1_list)
+        s1_list=args.s1_list, top_k_override=args.top_k)
