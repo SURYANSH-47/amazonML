@@ -139,8 +139,12 @@ def load_gt(path, want):
 
 # -------------------------------------------------------------- channels
 
-def tfidf_channel(q_text, t_text, k, analyzer, max_df):
-    """Top-k cosine neighbours. Returns {q_idx: [(t_idx, cos, rank), ...]}."""
+def tfidf_topk(q_text, t_text, k, analyzer, max_df, q_chunk=200_000):
+    """Top-k cosine neighbours as a CSR matrix (row = query, sorted desc).
+
+    Queries are multiplied in chunks so the transient product for 1.7M
+    production queries stays bounded; results are identical to one pass.
+    """
     t0 = time.time()
     vec = TfidfVectorizer(analyzer=analyzer, ngram_range=(3, 3), min_df=2,
                           max_df=max_df, sublinear_tf=True, dtype=np.float32)
@@ -148,19 +152,73 @@ def tfidf_channel(q_text, t_text, k, analyzer, max_df):
     Q = vec.transform(q_text)
     TT = T.T.tocsr()
     del T
-    R = sp_matmul_topn(Q, TT, top_n=k, sort=True, n_threads=THREADS)
-    del TT, Q
-    out = {}
-    for i in range(R.shape[0]):
-        a, b = R.indptr[i], R.indptr[i + 1]
-        if b > a:
-            out[i] = [(int(j), float(c), rk) for rk, (j, c) in
-                      enumerate(zip(R.indices[a:b], R.data[a:b]))]
+    parts = []
+    for s in range(0, Q.shape[0], q_chunk):
+        parts.append(sp_matmul_topn(Q[s:s + q_chunk], TT, top_n=k, sort=True,
+                                    n_threads=THREADS))
+    R = sp.vstack(parts).tocsr() if len(parts) > 1 else parts[0].tocsr()
     log(f"      {analyzer} top-{k}: vocab={len(vec.vocabulary_)} "
-        f"({time.time()-t0:.0f}s)")
-    del R, vec
+        f"queries={Q.shape[0]} ({time.time()-t0:.0f}s)")
+    del TT, Q, vec, parts
     gc.collect()
-    return out
+    return R
+
+
+def csr_row(R, i):
+    """[(t_idx, cos, rank0), ...] for query i, best first."""
+    a, b = R.indptr[i], R.indptr[i + 1]
+    return [(int(j), float(c), rk) for rk, (j, c) in
+            enumerate(zip(R.indices[a:b], R.data[a:b]))]
+
+
+UNION_KEYS = ["c2_cos", "c2_rank", "c2b_cos", "c2b_rank", "c3_cos", "c3_rank",
+              "c4", "c1_score", "c1_rank"]
+
+
+def build_union(qidx, R, c4, c1_rows=None, track=False):
+    """Union of every channel's candidates for the queries in qidx.
+
+    Shared by the validation harness and production so the reranker sees
+    identically constructed candidates and channel evidence in both.
+    Returns (qi, ti, chan_arrays, membership_or_None).
+    """
+    qi_l, ti_l = [], []
+    cols = {k: [] for k in UNION_KEYS}
+    cols["n"] = []
+    membership = defaultdict(lambda: defaultdict(set)) if track else None
+    for qi in qidx:
+        cands = {}
+        for name in ("c2", "c2b", "c3"):
+            if R.get(name) is not None:
+                for ti, cos, rk in csr_row(R[name], qi):
+                    d = cands.setdefault(ti, {})
+                    d[f"{name}_cos"] = cos
+                    d[f"{name}_rank"] = rk + 1
+        for ti, nk in c4.get(qi, {}).items():
+            cands.setdefault(ti, {})["c4"] = nk
+        if c1_rows is not None:
+            for ti, score, rk in c1_rows(qi):
+                d = cands.setdefault(ti, {})
+                d["c1_score"] = score
+                d["c1_rank"] = rk + 1
+        for ti, d in cands.items():
+            qi_l.append(qi); ti_l.append(ti)
+            for k in UNION_KEYS:
+                cols[k].append(d.get(k, 0.0))  # 0 = not retrieved by this channel
+            cols["n"].append(sum(1 for c in ("c2", "c2b", "c3") if f"{c}_cos" in d)
+                             + ("c4" in d) + ("c1_rank" in d))
+            if track:
+                for c in ("c2", "c2b", "c3"):
+                    if f"{c}_cos" in d:
+                        membership[c][qi].add(ti)
+                if "c4" in d:
+                    membership["c4"][qi].add(ti)
+                if "c1_rank" in d:
+                    membership["c1"][qi].add(ti)
+                    if d["c1_rank"] <= 60:
+                        membership["c1@60"][qi].add(ti)
+    chan = {k: np.asarray(v, np.float32) for k, v in cols.items()}
+    return (np.asarray(qi_l, np.int64), np.asarray(ti_l, np.int64), chan, membership)
 
 
 def exact_channel(Q, T):
@@ -216,6 +274,17 @@ def word_matrices(q_list, t_list):
     return Q.tocsr(), T.tocsr()
 
 
+def build_word_mats(Q, T):
+    """Word-incidence matrices + row sums for name and address, built once
+    per country and reused by every chunk's pair_features call."""
+    wm = {}
+    for field in ("name", "addr"):
+        Qw, Tw = word_matrices(getattr(Q, field), getattr(T, field))
+        wm[field] = (Qw, Tw, np.asarray(Qw.sum(axis=1)).ravel(),
+                     np.asarray(Tw.sum(axis=1)).ravel())
+    return wm
+
+
 def rowpair_dot(A, B, ai, bi, chunk=500_000):
     out = np.empty(len(ai), dtype=np.float32)
     for s in range(0, len(ai), chunk):
@@ -224,8 +293,13 @@ def rowpair_dot(A, B, ai, bi, chunk=500_000):
     return out
 
 
-def pair_features(Q, T, qi, ti, chan):
-    """Vectorized features for pairs (qi[k], ti[k])."""
+def pair_features(Q, T, qi, ti, chan, wm=None):
+    """Vectorized features for pairs (qi[k], ti[k]).
+
+    wm: precomputed build_word_mats(Q, T); built here if not given.
+    """
+    if wm is None:
+        wm = build_word_mats(Q, T)
     n = len(qi)
     F = np.zeros((n, len(FEATURES)), dtype=np.float32)
     col = {f: j for j, f in enumerate(FEATURES)}
@@ -246,16 +320,15 @@ def pair_features(Q, T, qi, ti, chan):
     F[:, col["r_addr_tset"]] = cpdist(qa, ta, scorer=fuzz.token_set_ratio, **W)
 
     for field, pre in (("name", "name"), ("addr", "addr")):
-        Qw, Tw = word_matrices(getattr(Q, field), getattr(T, field))
+        Qw, Tw, qsum, tsum = wm[field]
         inter = rowpair_dot(Qw, Tw, qi, ti)
-        qs = np.asarray(Qw.sum(axis=1)).ravel()[qi]
-        ts = np.asarray(Tw.sum(axis=1)).ravel()[ti]
+        qs = qsum[qi]
+        ts = tsum[ti]
         union = qs + ts - inter
         F[:, col[f"{pre}_word_jac"]] = np.divide(inter, union, out=np.zeros(n, np.float32), where=union > 0)
         mn = np.minimum(qs, ts)
         F[:, col[f"{pre}_word_ovl"]] = np.divide(inter, mn, out=np.zeros(n, np.float32), where=mn > 0)
         F[:, col[f"n_{pre}_words"]] = inter
-        del Qw, Tw
 
     ql = np.array([len(x) for x in qn], np.float32)
     tl = np.array([len(x) for x in tn], np.float32)
@@ -285,8 +358,7 @@ def pair_features(Q, T, qi, ti, chan):
 
 # ------------------------------------------------------------ one country
 
-def run_country(country, q_ids, s1rec, split_dir, split, args, c1_all):
-    log(f"\n=== {country}: {len(q_ids)} queries ===")
+def load_country(country, q_ids, s1rec, split_dir, split):
     t0 = time.time()
     tids, tsrc, tnames, taddrs = load_targets(split_dir, split, country)
     log(f"  targets: {len(tids)} ({time.time()-t0:.0f}s)")
@@ -294,76 +366,53 @@ def run_country(country, q_ids, s1rec, split_dir, split, args, c1_all):
     del tnames, taddrs
     Q = Records(q_ids, [1] * len(q_ids), [s1rec[e][0] for e in q_ids],
                 [s1rec[e][1] for e in q_ids])
-    tpos = {e: i for i, e in enumerate(tids)}
+    return Q, T
 
-    chans = {}
-    if "c2" in args.channels:
-        chans["c2"] = tfidf_channel(Q.name, T.name, TOPK["c2"], "char_wb", args.max_df)
-    if "c2b" in args.channels:
-        chans["c2b"] = tfidf_channel(Q.phonc, T.phonc, TOPK["c2b"], "char", args.max_df)
-    if "c3" in args.channels:
-        chans["c3"] = tfidf_channel(Q.addr, T.addr, TOPK["c3"], "char_wb", args.max_df)
-    c4 = exact_channel(Q, T) if "c4" in args.channels else {}
 
-    # union, remembering each channel's evidence for the reranker
-    per_q = defaultdict(dict)  # qi -> ti -> {feature: value}
-    for name in ("c2", "c2b", "c3"):
-        for qi, lst in chans.get(name, {}).items():
-            for ti, cos, rk in lst:
-                d = per_q[qi].setdefault(ti, {})
-                d[f"{name}_cos"] = cos
-                d[f"{name}_rank"] = rk + 1
-    for qi, hits in c4.items():
-        for ti, nk in hits.items():
-            per_q[qi].setdefault(ti, {})["c4"] = nk
-    for qi, e in enumerate(q_ids):
-        for cid, score, rk in c1_all.get(e, ()):
+def retrieve(Q, T, channels, max_df):
+    """Run every enabled channel once for all queries of a country."""
+    R = {}
+    if "c2" in channels:
+        R["c2"] = tfidf_topk(Q.name, T.name, TOPK["c2"], "char_wb", max_df)
+    if "c2b" in channels:
+        R["c2b"] = tfidf_topk(Q.phonc, T.phonc, TOPK["c2b"], "char", max_df)
+    if "c3" in channels:
+        R["c3"] = tfidf_topk(Q.addr, T.addr, TOPK["c3"], "char_wb", max_df)
+    c4 = exact_channel(Q, T) if "c4" in channels else {}
+    return R, c4
+
+
+def run_country(country, q_ids, s1rec, split_dir, split, args, c1_all):
+    log(f"\n=== {country}: {len(q_ids)} queries ===")
+    t0 = time.time()
+    Q, T = load_country(country, q_ids, s1rec, split_dir, split)
+    tpos = {e: i for i, e in enumerate(T.ids)}
+    R, c4 = retrieve(Q, T, args.channels, args.max_df)
+
+    def c1_rows(qi):
+        out = []
+        for cid, score, rk in c1_all.get(q_ids[qi], ()):
             ti = tpos.get(cid)
             if ti is not None:
-                d = per_q[qi].setdefault(ti, {})
-                d["c1_score"] = score
-                d["c1_rank"] = rk + 1
+                out.append((ti, score, rk))
+        return out
 
-    qi_l, ti_l = [], []
-    keys = ["c2_cos", "c2_rank", "c2b_cos", "c2b_rank", "c3_cos", "c3_rank",
-            "c4", "c1_score", "c1_rank"]
-    cols = {k: [] for k in keys}
-    cols["n"] = []
-    membership = defaultdict(lambda: defaultdict(set))  # channel -> qi -> {ti}
-    for qi, cands in per_q.items():
-        for ti, d in cands.items():
-            qi_l.append(qi); ti_l.append(ti)
-            for k in keys:
-                # rank 0 = "not retrieved by this channel"
-                cols[k].append(d.get(k, 0.0))
-            cols["n"].append(sum(1 for c in ("c2", "c2b", "c3") if f"{c}_cos" in d)
-                             + ("c4" in d) + ("c1_rank" in d))
-            for c in ("c2", "c2b", "c3"):
-                if f"{c}_cos" in d:
-                    membership[c][qi].add(ti)
-            if "c4" in d:
-                membership["c4"][qi].add(ti)
-            if "c1_rank" in d:
-                membership["c1"][qi].add(ti)
-                if d["c1_rank"] <= 60:
-                    membership["c1@60"][qi].add(ti)
-    qi_a = np.asarray(qi_l, np.int64)
-    ti_a = np.asarray(ti_l, np.int64)
-    chan = {k: np.asarray(v, np.float32) for k, v in cols.items()}
+    qi_a, ti_a, chan, membership = build_union(range(Q.n), R, c4,
+                                               c1_rows if c1_all else None, track=True)
     log(f"  union: {len(qi_a)} pairs ({len(qi_a)/max(len(q_ids),1):.1f}/query)")
 
     t1 = time.time()
-    F = pair_features(Q, T, qi_a, ti_a, chan)
+    F = pair_features(Q, T, qi_a, ti_a, chan, build_word_mats(Q, T))
     log(f"  features: {F.shape} ({time.time()-t1:.0f}s)")
 
     result = {
         "s1": np.asarray([q_ids[i] for i in qi_a]),
-        "cand": np.asarray([tids[i] for i in ti_a]),
+        "cand": np.asarray([T.ids[i] for i in ti_a]),
         "F": F,
-        "membership": {c: {q_ids[qi]: {tids[t] for t in s} for qi, s in m.items()}
+        "membership": {c: {q_ids[qi]: {T.ids[t] for t in s} for qi, s in m.items()}
                        for c, m in membership.items()},
     }
-    del T, Q, per_q, chans, c4
+    del T, Q, R, c4
     gc.collect()
     log(f"  {country} done ({time.time()-t0:.0f}s)")
     return result
