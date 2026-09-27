@@ -8,16 +8,18 @@
 
 ## 1. Executive Summary
 
-We resolve Source-1 business entities against Source-2/3 with a two-stage
-pipeline: SQLite-backed inverted-index blocking (name/address/digit tokens,
-country-scoped, with block-purging of uninformative keys) narrows ~10M
-candidate records per source down to a small ranked top-K per Source-1
-entity, and a from-scratch-trained LightGBM classifier over ~17 string-
-similarity features makes the final call, with the probability threshold and
-an optional per-entity match cap tuned directly against the macro F_0.5
-metric on a held-out validation split. The whole pipeline streams data
-end-to-end (never loading a full source file into memory) to run within this
-machine's ~4GB RAM budget.
+We resolve each Source-1 business against Source-2/3 with **multi-channel
+retrieval followed by a two-stage learned reranker**. Four independent
+retrieval channels — name character n-grams, a phonetic skeleton of the name
+that bridges native-script and English spellings, address character n-grams
+with compound house numbers preserved, and exact keys — are unioned into
+~146 candidates per business, lifting the retrieval recall ceiling from 76%
+to **97.1%**. A LightGBM reranker scores every candidate; a second stage then
+re-scores each candidate *relative to its rivals for the same business*.
+Final matches are chosen by an expected-F0.5 rule under a one-owner
+constraint discovered in the ground truth. Held-out macro F0.5: **0.8978**,
+up from 0.7930 for our first architecture (leaderboard 0.767 → **[final
+leaderboard score]**).
 
 ---
 
@@ -25,227 +27,190 @@ machine's ~4GB RAM budget.
 
 ### 2.1 Problem Analysis
 
-EDA surfaced several noise patterns not obvious from the problem statement
-alone:
-
-- **Scale**: the provided files are far larger than "billions of records"
-  suggests in practice — ~2.2M Source-1 / ~5M Source-2 / ~5.3M Source-3 rows
-  for training, similarly sized for test — but still far too large to load
-  into pandas on a memory-constrained machine, which drove the SQLite-backed
-  streaming design.
-- **Script mismatch**: Source 1 names are always Latin/ASCII, but a material
-  fraction of Source 2/3 India records use native scripts (Devanagari,
-  Tamil, Kannada, ...) for the *same* business name, while addresses for
-  those same records stay mostly Latin. This makes pure Latin-token
-  comparison fail on name alone for these rows; we fold non-Latin scripts to
-  a Latin approximation with `unidecode` (a bundled, deterministic
-  transliteration table — no live lookups) so they become comparable.
-- **Country is a very strong, very consistent signal**: on a 69k true-match
-  sample, `country` matched between a Source-1 entity and every one of its
-  true Source-2/3 matches 100% of the time. We use it as a hard blocking
-  filter.
-- **Legal-suffix and locale noise**: abbreviation variants (Corp/Corporation,
-  Pvt/Private, Ltd/Limited), French suffixes not present in training
-  (SARL/SASU/EURL) that appear in the test-only France segment, punctuation
-  differences, and word-order changes are all handled by a shared
-  normalization step (lowercase, accent/script fold, punctuation strip,
-  legal-suffix removal) rather than per-country special-casing, since the
-  problem statement explicitly requires treating `country` as an open set.
-- **Missing addresses**: Source-1 addresses are never empty in the sampled
-  data, but Source-3 has empty addresses on ~3% of rows — handled via
-  missingness indicator features rather than dropped.
-- **Ground truth shape**: only ~5.6% of Source-1 entities are singletons;
-  non-singletons average ~3.5 matches, with a handful up to double digits —
-  so the "many" case in the problem statement is common, not an edge case.
+- **Scale and constraints.** ~2.2M Source-1 and ~10.3M Source-2/3 records for
+  training, similar for test (1.73M Source-1 queries against ~10M records).
+  Everything is streamed or held per country; nothing assumes the full
+  corpus fits in memory.
+- **Country is exact.** On a 69k true-match sample, a Source-1 entity and
+  every one of its true matches share `country` 100% of the time, so every
+  channel is scoped per country. `country` is treated as an open label set —
+  the test-only France segment flows through the same code path.
+- **One owner per record.** In the training ground truth, 0 of 7,638,365
+  matched Source-2/3 records belong to more than one Source-1 entity. Any
+  record claimed by two businesses is a certain error for all but one.
+- **Retrieval, not the classifier, was the bottleneck.** Our first
+  classifier already reached AUC 0.999; the score was capped by true matches
+  never reaching it.
+- **What the missed matches actually were.** Reading true pairs that our
+  first retrieval never surfaced revealed three concrete failure classes:
+  1. *Native-script names*: English business names written phonetically in
+     Devanagari, Gujarati, Kannada or Tamil (`सुप्रीम इंजीनियरिंग एलएलपी` =
+     "Supreme Engineering LLP"). Source 1 is always Latin.
+  2. *Compound house numbers*: in Indian addresses the most distinctive
+     field is the house/plot number (`6-3-10/3`, `D-2/2A`, `23-12-22`).
+     A generic normalizer strips `-` and `/` and shreds these into common
+     digits shared by thousands of records.
+  3. *Replaced names*: some records carry a DBA wrapper, a domain
+     (`smartit.com`), or an unrelated name (`Synnex`) and survive only via
+     the address.
+- **Two different retrieval failures.** At full scale, most misses were
+  retrieved but *ranked* below lookalikes (top-60 recall 76%, top-300 85%);
+  the rest were never retrieved at all. They need different fixes.
 
 ### 2.2 Solution Strategy
 
-**Approach Type:** Blocking + Classifier (candidate generation followed by a
-supervised pairwise matcher), the standard architecture for large-scale
-entity resolution.
+**Approach Type:** Hybrid — multi-channel candidate retrieval (unioned) +
+two-stage learned reranker + constrained assignment.
 
-**Core Innovation:** IDF-weighted meta-blocking with a *per-entity* cost
-budget, implemented entirely as indexed SQL over SQLite so peak memory stays
-bounded regardless of corpus size. Rather than discarding common keys
-globally (which is what a first version did, and which capped recall at 54%
-— see §5), every key is retained and weighted by rarity, while cost is
-controlled per Source-1 entity by probing only its own most selective keys.
-Combined with tuning the decision threshold *and* a per-entity top-N cap
-directly against the official macro F_0.5 metric rather than a generic 0.5
-cutoff.
+**Core Innovation:** Retrieval channels designed around the specific
+observed failure classes, unioned so each rescues what the others miss;
+a second-stage reranker that judges each candidate against its rivals for
+the same business; and one-owner assignment exploiting a structural
+property of the data.
 
 ---
 
 ## 3. Candidate Generation (Blocking)
 
-- **Blocking keys used (9 types per record):** normalized-name tokens,
-  normalized-address tokens, digit tokens from the raw address, postal-code
-  tokens (5/6-digit runs, far more discriminative than house numbers), a
-  4-character name prefix, the exact normalized name, the
-  alphabetically-sorted name (makes word-order transposition a no-op), and
-  phonetic skeletons of both the whole name and its individual tokens (these
-  survive vowel-level typos and transliteration drift — `shivshakti` and
-  `shivshakthi` collapse to the same key, which matters because Source 1 is
-  always Latin while Source 2/3 India records are often in native script).
-  Every key is scoped to an exact `country` match.
+### Normalization (`src/mc_normalize.py`)
+Deterministic, rule-based, no external data or lookups:
+- Unicode NFKD + `unidecode` transliteration; zero-width joiners removed
+  first (inside Indic words they otherwise become spurious word breaks).
+- Legal suffixes stripped (US/India/France forms: Inc, LLC, Pvt, Ltd, SARL,
+  SASU, EURL, ...); DBA wrappers resolved to the trade name; honorifics
+  (`Mr`, `M/s`) and domain tokens (`www`, `com`) removed.
+- Address abbreviations canonicalized (`Rd`→road, `St`→street); placeholders
+  (`<NULL>`, `null`) dropped; compound house numbers re-appended as single
+  tokens (`6-3-10/3` → `h6x3x10x3`) so they survive character n-grams.
+- **Phonetic skeleton** of the name: soft g/c handled first (English
+  "energy"/"center" use sounds Indic scripts write as ज/स), consonant
+  clusters canonicalized, non-leading vowels dropped, and transliterated
+  legal suffixes stripped at the phonetic level. On observed misses this
+  raises cross-script name similarity e.g. *Prime Om Energy* 71→100,
+  *Jain Infotech* 52→100, *Creative Investments* →100.
 
-- **No purging — IDF weighting instead.** Keys are never deleted. A shared
-  key contributes `key_type_prior × log(N/df)`, so a rare shared key is
-  strong evidence while a common one still counts for something. This is
-  what lets a true match survive on two moderately-common name tokens when
-  one side has no address at all.
+### Retrieval channels (`src/mc_experiment.py`)
 
-- **Cost control is per-entity, not global.** Each Source-1 entity probes
-  using only its own most selective keys (rarest first) until a cumulative-df
-  budget is spent — Block Filtering. Entities left candidate-poor are
-  re-probed with a larger budget, capped at a fraction of each batch so the
-  blended cost stays bounded. The only deletion performed is of keys with
-  `df > 25,000`, which probing already refuses to touch; this is
-  recall-neutral by construction and removed 24-27% of index rows, purely
-  for cache locality.
+| Channel | Method | Targets |
+| --- | --- | --- |
+| c2 | name char-3-gram TF-IDF, top-50 | typos (`lnfotech`), partial and domain names |
+| c2b | phonetic-skeleton char-3-gram TF-IDF, top-40 | native script ↔ English |
+| c3 | address char-3-gram TF-IDF, top-50 | replaced / garbage names, sparse addresses |
+| c4 | exact keys: full / sorted / phonetic name, house no., postal | cheap near-certain hits |
 
-- **Ranking / cap:** candidates ranked by accumulated IDF weight, capped at
-  top-K per entity (Cardinality Node Pruning). K=60 for the final run.
+Candidates from all channels are **unioned**, keeping each channel's score
+and rank as reranker features. TF-IDF top-k is a sparse matrix product
+(`sparse_dot_topn`), per country, in memory.
 
-- **Candidate pairs generated:** 1,732,544 Source-1 entities, ≤60 candidates
-  each (see `output/candidate_pairs.tsv`).
+**Query-side n-gram pruning.** Each query searches with only its ~14–22
+rarest n-grams. Search cost is the sum of the posting-list lengths of the
+query's n-grams, dominated by common fragments (`del`, `mum`, `roa`) that
+carry little identifying signal. Pruning cut search from a projected ~12h to
+a few ms per query while changing union recall by only 97.10% → 97.06%.
 
-- **How true matches were not lost:** measured directly with
-  `src/check_recall.py`, which reports the recall ceiling in minutes and was
-  run before every long job. On the full training corpus, final configuration:
-  **75.5% pair-level recall**, up from 54% under the initial purging design.
-  Measured cost/recall trade-off (full corpus, `--n 800`):
+### Measured retrieval (40,000 held-out Source-1 entities, full corpus)
 
-  | config | pair recall | throughput |
-  | --- | --- | --- |
-  | top_k=25, budget=400 | 65.4% | 25.3/s |
-  | top_k=25, budget=1500 | 70.1% | 24.6/s |
-  | top_k=60, budget=3000 | 76.8% | 9.1/s |
-  | top_k=25, budget=15000 | 79.4% | 2.4/s |
+| Channel | Pair recall | Entities with all matches | Entities with none |
+| --- | --- | --- | --- |
+| c2 name | 0.630 | 0.370 | 0.167 |
+| c2b phonetic | 0.583 | 0.303 | 0.197 |
+| c3 address | 0.875 | 0.688 | 0.021 |
+| c4 exact | 0.631 | 0.322 | 0.114 |
+| **UNION** | **0.971** | **0.913** | **0.003** |
 
-  The residual misses are pairs sharing too little literal text for lexical
-  blocking to reach at affordable cost — closing that gap needs learned
-  embeddings with an ANN index rather than more tuning (see §6).
+India 0.960, US 0.978. For comparison, our first architecture reached 0.761
+(top-60) with ~6.7% of entities having no true match retrieved at all.
+
+**Leave-one-out** (union recall without the channel): c2 0.963, c2b 0.967,
+**c3 0.799**, c4 0.963 — every channel contributes matches no other finds.
+
+- **Candidate pairs generated:** mean ~146 per Source-1 entity (median 132,
+  p90 209). The larger candidate set is deliberate: it is what moves the
+  recall ceiling from 76% to 97%.
+- **How true matches were not lost:** every retrieval change was measured
+  on the held-out set at **full corpus scale** before use. A small-sample
+  measurement misled us once — an early design measured 94% recall on 20k
+  entities and 54% at full scale — so no retrieval decision here rests on a
+  sample.
 
 ---
 
 ## 4. Matching Model
 
-**Features used** (`src/features.py`, 23 features per pair):
-- Name features: token Jaccard, token overlap coefficient, `rapidfuzz`
-  Levenshtein ratio, token-sort ratio, token-set ratio, partial ratio,
-  4-char prefix exact match, full normalized-name exact match, name length
-  ratio.
-- Address features: token Jaccard, token overlap coefficient, `rapidfuzz`
-  Levenshtein ratio, digit-token (house/PIN/zip-like number) Jaccard,
-  missing-address indicators for both sides.
-- Blocking-derived: the accumulated IDF blocking score, exact match on the
-  sorted-token name, exact match on the phonetic skeleton, phonetic-token
-  Jaccard, exact postal-code match, and raw counts of shared name and
-  address tokens.
-- Other: candidate source (2 vs 3).
+**Pair features (32)**, fully vectorized (`rapidfuzz.process.cpdist`,
+sparse row products):
+- Name: Levenshtein, token-sort, token-set and partial ratios; phonetic
+  token-set ratio; word Jaccard / overlap / shared count; exact, sorted and
+  phonetic equality; length ratio.
+- Address: Levenshtein and token-set ratios; word Jaccard / overlap /
+  shared count; compound house-number match; postal-code match; empty flags.
+- Retrieval evidence: each channel's cosine and rank, exact-key count,
+  number of channels that found the candidate.
 
-**Model type:** LightGBM binary classifier (gradient-boosted trees),
-`num_leaves=31`, `learning_rate=0.05`, early stopping on a held-out dev
-slice of the training pairs. Trained entirely from scratch on this
-challenge's data — not a downloaded/pretrained foundation model — so it
-trivially satisfies the "MIT/Apache-2.0 license, ≤8B parameters" constraint.
+**Two-stage reranker (LightGBM):**
+- *Stage 1* scores each pair in isolation (4.37M training pairs, 30k
+  training entities, disjoint from validation).
+- *Stage 2* adds each candidate's standing among its rivals for the same
+  business: stage-1 score, its rank, ratio to the best, margin over the best
+  alternative, candidate count, number of strong candidates, total score.
+  A same-name chain store and the true match can look alike in isolation
+  and very different side by side. Stage 2 is trained on **out-of-fold**
+  stage-1 scores (3 folds by entity) so it learns from the score
+  distribution it will see at inference. The five most important stage-2
+  features are all rival-comparison features.
 
-**Threshold selection method:** entity-level train/validation split (hashed,
-not random, for reproducibility) of Source-1 entities so there is no
-pair-level leakage. On the held-out validation entities, we sweep both the
-probability threshold and an optional per-entity top-N cap on kept matches,
-directly maximizing the official macro F_0.5 metric (`src/evaluate.py`,
-matching the singleton-inclusive per-entity definition in the problem
-statement) rather than optimizing a proxy metric like AUC or accuracy.
+**Decision rule and threshold selection.** Tuned directly on macro F0.5 on
+the held-out set (never on AUC). Best: an **expected-F0.5 rule** — for each
+business choose the number of matches m maximizing
+`1.25·S_m / (0.25·T + m)` (S_m = sum of the top-m probabilities, T = expected
+true-match count), predicting empty when a singleton is more likely — plus
+**one-owner enforcement**: each record goes only to its highest-probability
+claimant. (Chosen config: r=0.9, s=1.0, floor=0.2, exclusive.)
+
+**Models:** LightGBM gradient-boosted trees trained from scratch on the
+provided training data only — no pretrained or external model — well within
+the MIT/Apache-2.0, ≤8B-parameter constraint.
 
 ---
 
 ## 5. Results & Error Analysis
 
-### Final results
+| Version | Retrieval recall | Held-out F0.5 | Leaderboard |
+| --- | --- | --- | --- |
+| v1: SQLite blocking, hard key purging | 0.54 | 0.639 | 0.641 |
+| v2: purge fix, stale config re-applied old cap | ~0.55 | — | 0.648 |
+| v3: IDF meta-blocking, top-60 | 0.755 | 0.790 | 0.767 |
+| **v4: multi-channel + two-stage reranker** | **0.971** | **0.898** | **[final]** |
 
-| metric | value |
-| --- | --- |
-| **Leaderboard macro F_0.5** | **0.767** |
-| Held-out validation macro F_0.5 | 0.7899 |
-| Validation precision / recall | 0.8575 / 0.6561 |
-| Blocking pair-recall ceiling (validation) | 0.7553 |
-| Chosen operating point | threshold 0.6, top_n 6 |
-| Training pairs | 3,580,933 (positive rate 4.4%) |
-| Dev AUC | 0.9989 |
+Final held-out detail: precision 0.927, recall 0.825; stage 1 alone 0.8876,
+stage 2 0.8978.
 
-### The result that mattered most: a blocking design error
-
-The first version used **block purging** — globally deleting any key whose
-Source-2/3 frequency exceeded an absolute cap. On a 20k-entity sample this
-measured 94% recall and looked fine. At full scale it collapsed to **54%**,
-and that single number capped the leaderboard score at 0.641 no matter how
-good the classifier was (dev AUC was already 0.999).
-
-Two compounding causes:
-1. The cap was **absolute**, tuned on a sample ~80x smaller than the real
-   corpus. The same threshold is drastically more aggressive once document
-   frequencies scale up — it removed 78% of all keys at full scale versus
-   ~25% on the sample.
-2. Frequency was computed **globally** rather than per-country, even though
-   the join is country-scoped, so a key common in one country was deleted
-   everywhere.
-
-Deletion is also irrecoverable: an entity whose only keys happened to be
-common was left with no candidates at all. Replacing purging with IDF
-weighting plus per-entity cost budgeting took recall 54% → 75.5% and the
-score 0.641 → 0.767.
-
-**Lesson:** validate blocking recall at realistic corpus scale. A small
-sample cannot expose a frequency-threshold bug, because the thing that
-breaks *is* the frequency distribution. `src/check_recall.py` exists
-precisely so this number is measured in minutes, before any multi-hour job.
-
-### Error analysis
-
-- **False positives (precision 0.858 — now the binding constraint).** Under
-  F_0.5 a false merge costs roughly twice a miss, so this is where the
-  remaining headroom is. The dominant pattern is same-name-different-location
-  businesses — chains and generic trade names ("City Dental", "Sri Sai
-  Enterprises") where name evidence is strong and address evidence is weak
-  or missing. The sorted-token and phonetic keys, which bought recall, also
-  pull in more of exactly this kind of near-duplicate.
-- **False negatives.** Two distinct sources: ~24% of true pairs never reach
-  the model at all (blocking ceiling), and the model discards a further
-  ~10pp of what does reach it. The blocking misses are pairs sharing very
-  little literal text — heavy transliteration, a genuinely different trade
-  name, or an address present on only one side.
-- **Country generalization.** Validation is necessarily train-only (US +
-  India), while the test set is ~15% France. Validation predicted 0.79 and
-  the leaderboard returned 0.767; the earlier submission tracked within
-  0.3%. The most likely explanation is that the threshold was tuned on two
-  countries and applied to a third that validation cannot observe.
+- **Where the remaining score is lost.** Retrieval now surfaces 97% of true
+  matches, but final recall is 0.825 — the reranker/decision layer is the
+  binding constraint, not retrieval.
+- **Common false positives:** same-name businesses at different locations
+  (chains, generic trade names) and different businesses sharing a building
+  (the address channel surfaces every tenant of a commercial complex).
+  One-owner enforcement removes the subset where the rightful owner is also
+  a candidate; it is understated on validation, where only 70k of 2.2M
+  entities compete, and fully active on the test set.
+- **Common false negatives:** heavily perturbed pairs where the name is
+  replaced *and* the address is sparse; Tamil/Gujarati transliterations
+  where voicing differs (Tamil script does not distinguish b/p).
 
 ---
 
 ## 6. Conclusion
 
-Country-scoped lexical blocking plus a lightweight gradient-boosted
-classifier reaches **0.767** macro F_0.5 on this data with no pretrained
-model, provided normalization handles script mismatch and open-set locale
-variation. The decisive lesson was not about modelling: the classifier was
-near-ceiling (dev AUC 0.999) throughout, and every point of score came from
-candidate generation. Hard block purging — discarding keys above an absolute
-frequency cap — is the trap, because it is tuned on a distribution that
-shifts with corpus size and destroys recall irrecoverably; replacing it with
-IDF weighting and per-entity cost budgeting moved recall 54% → 75.5% and the
-score 0.641 → 0.767.
-
-With more time, the next gains in priority order: (1) **precision** (0.858),
-which F_0.5 penalizes at double weight and which is dominated by
-same-name-different-location chains — addressable with targeted features and
-hard-negative mining, within the existing architecture; (2) **per-country
-threshold tuning**, since the single global threshold is set by countries the
-test set only partly shares; (3) **learned-embedding retrieval with an ANN
-index** to reach the ~24% of true pairs that share too little literal text
-for lexical keys — the only one of the three that requires a different
-architecture rather than refinement of this one.
+The decisive lesson was that the score was capped by retrieval, not by the
+classifier, and that the fix came from reading the missed matches rather than
+tuning: they fell into concrete classes — native-script names, shredded
+compound house numbers, replaced names — each addressable by a dedicated
+retrieval channel. Unioning those channels took retrieval recall from 76% to
+97%, and a reranker that compares candidates against their rivals, plus the
+one-owner constraint, turned that into a held-out F0.5 of 0.898. A second
+lesson: every retrieval decision must be validated at full corpus scale,
+because frequency-dependent behaviour does not show up on small samples.
 
 ---
 
@@ -253,48 +218,37 @@ architecture rather than refinement of this one.
 
 ### A. Code Artefacts
 
-Complete, runnable code ships under `code/business_entity_resolution/`
-(`src/` for all source, `README.md` for exact reproduce steps,
-`requirements.txt` for pinned dependencies). Entry points:
+Runnable code is under `code/business_entity_resolution/` (`src/`,
+`README.md`, `requirements.txt`). The submission was produced by the
+multi-channel pipeline:
 
-1. `src/db.py` — stream a source TSV split into a SQLite DB with normalized
-   fields, blocking keys, key statistics and the materialized probe table.
-2. `src/check_recall.py` — measure the blocking recall ceiling in minutes.
-   Run before any long job; the model can never exceed this number.
-3. `src/train.py` — build labeled candidate pairs (blocking ∩ ground truth),
-   train the LightGBM matcher, tune threshold/top-N on held-out validation.
-4. `src/predict.py` — blocking → features → model, writing both output TSVs.
-   Supports `--shard i --num-shards N` for parallel execution.
-5. `src/merge_shards.py` — merge shard outputs and verify every required
-   Source-1 entity appears exactly once.
-6. `src/upgrade_db.py` — add key stats / probe table to an existing DB
-   without re-streaming the TSVs.
+| File | Role |
+| --- | --- |
+| `src/mc_normalize.py` | normalization and phonetic skeleton |
+| `src/mc_experiment.py` | retrieval channels, union, features, two-stage reranker training, held-out evaluation; writes `mc_m1.txt`, `mc_m2.txt`, `mc_report.json` |
+| `src/mc_predict.py` | production over the test set: per-country, chunked, resumable; writes and verifies `candidate_pairs.tsv` and `matching_results.tsv` |
+| `src/evaluate.py` | official macro F0.5 scorer for held-out evaluation |
 
-`src/pipeline.py` wraps build/train/predict as subcommands. See the README
-for the exact commands used to produce the submitted outputs.
+The first-generation pipeline (`db.py`, `blocking.py`, `features.py`,
+`train.py`, `predict.py`, `assign.py`, ...) is kept for reference; it
+produced the 0.767 submission. Exact commands are in the README.
 
 ### B. Additional Results
 
-**Scale.** Train 2,206,821 / 5,034,616 / 5,285,603 records (S1/S2/S3); test
-1,732,544 / 4,887,273 / 5,082,316. 162.5M Source-2/3 blocking-key rows over
-18.6M distinct keys before pruning; 139.8M after removing never-probed keys
-(26.8%). 19.1M materialized probe keys across the test entities.
+**Runtime engineering.** Features are fully vectorized (~40–60k pairs/s);
+retrieval is per-country sparse top-k with query pruning; normalized target
+records and union features are cached, so the reranker can be retrained
+from cache in minutes. Production runs one country at a time in chunks of
+40k queries to bound memory, writes each country atomically, and resumes
+after a crash without redoing finished countries.
 
-**Engineering constraints that shaped the design.** The pipeline was
-developed on a machine with ~4GB RAM, so every stage streams and is
-disk-backed; nothing loads a full source file into memory. Three measured
-optimizations mattered:
-
-| change | effect |
-| --- | --- |
-| `CROSS JOIN` to pin SQLite's join order | ~6x throughput (the planner otherwise scanned the 100M+ row table per batch) |
-| Materializing per-entity probe keys | removed the fixed per-entity overhead that capped throughput at ~25/s regardless of budget |
-| Pruning keys above the probe ceiling | 24-27% fewer index rows, recall-neutral by construction |
-| Sharding predict across 8 processes | ~53h → ~8h wall clock for the full test set |
-
-**Verification.** `utils/validate_submission.py` reports `PASS` on both
-output files; `merge_shards.py` independently confirms all 1,732,544
-required Source-1 entities are present exactly once.
+**Earlier-architecture findings retained for the record.** Hard block purging
+(global deletion of keys above an absolute frequency cap) collapsed recall
+from 94% on a 20k sample to 54% at full scale — the cap was tuned on a
+frequency distribution that shifts with corpus size, and deletion is
+irrecoverable for an entity whose only keys were common. Replacing it with
+IDF weighting and per-entity cost budgets gave v3 (0.767); the multi-channel
+design (v4) replaced that retrieval layer entirely.
 
 ---
 
