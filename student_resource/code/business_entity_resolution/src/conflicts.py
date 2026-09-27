@@ -12,7 +12,7 @@ import collections
 import sys
 
 
-def main(path):
+def main(path, write_entities=None):
     claims = collections.Counter()
     n_rows = n_nonempty = n_matches = 0
     with open(path, encoding="utf-8") as f:
@@ -29,13 +29,23 @@ def main(path):
 
     contested = {k: v for k, v in claims.items() if v > 1}
     excess = sum(v - 1 for v in contested.values())
-    entities_hit = 0
+    hit_ids = []
     with open(path, encoding="utf-8") as f:
         next(f)
         for line in f:
-            _, _, rest = line.rstrip("\n").partition("\t")
+            s1, _, rest = line.rstrip("\n").partition("\t")
             if rest and any(i in contested for i in rest.split(",")):
-                entities_hit += 1
+                hit_ids.append(s1)
+    entities_hit = len(hit_ids)
+    if write_entities:
+        # Every claimant of a contested record is in this list by definition,
+        # so re-scoring exactly these entities gives the full information
+        # needed to resolve every conflict — nothing else needs re-running.
+        with open(write_entities, "w", encoding="utf-8") as f:
+            f.write("source1_entity_id\n")
+            for e in hit_ids:
+                f.write(e + "\n")
+        print(f"wrote {entities_hit} conflicted entity ids to {write_entities}")
 
     print(f"rows: {n_rows}, entities with matches: {n_nonempty}, total matches: {n_matches}")
     print(f"records claimed by >1 entity: {len(contested)}")
@@ -48,4 +58,10 @@ def main(path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "output/matching_results.tsv")
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("path", nargs="?", default="output/matching_results.tsv")
+    ap.add_argument("--write-entities", default=None,
+                    help="Write the ids of every entity touched by a conflict here.")
+    args = ap.parse_args()
+    main(args.path, args.write_entities)

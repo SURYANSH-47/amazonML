@@ -33,7 +33,16 @@ def load_model(models_dir):
 
 
 def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None,
-        shard=0, num_shards=1):
+        shard=0, num_shards=1, scores_out=None, score_floor=0.05, select="all",
+        s1_list=None):
+    """scores_out: if set, also write every scored pair (s1, cand, prob) with
+    prob >= score_floor. This moves all final decisions (thresholds, one-owner
+    enforcement across entities) to assign.py, which runs in minutes — so the
+    decision layer can be retuned without repeating this multi-hour pass.
+
+    select="val": restrict to held-out validation-bucket entities (never seen
+    in training), for producing labeled score dumps on train.db.
+    """
     booster, config = load_model(models_dir)
     top_k = config["blocking_top_k"]
     min_score = config["blocking_min_score"]
@@ -49,6 +58,10 @@ def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None,
     match_f = open(matching_out, "w", encoding="utf-8", newline="")
     cand_f.write("source1_entity_id\tcandidate_entity_ids\n")
     match_f.write("source1_entity_id\tmatched_entity_ids\n")
+    score_f = None
+    if scores_out:
+        score_f = open(scores_out, "w", encoding="utf-8", newline="")
+        score_f.write("source1_entity_id\tcandidate_entity_id\tprob\n")
 
     batch_results = []
     n_entities = 0
@@ -70,6 +83,8 @@ def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None,
             probs = booster.predict(np.asarray(X, dtype=np.float32))
             for s1_id, cid, p in zip(s1_out, cand_out, probs):
                 probs_by_pair.setdefault(s1_id, []).append((cid, p))
+                if score_f is not None and p >= score_floor:
+                    score_f.write(f"{s1_id}\t{cid}\t{p:.5f}\n")
 
         for s1 in entity_order:
             if s1 in empty_ids:
@@ -93,8 +108,21 @@ def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None,
     # bottleneck is random disk I/O on one SQLite reader, so running N workers
     # over the same read-only DB scales close to linearly.
     shard_ids = None
-    if num_shards > 1:
-        all_ids = [r[0] for r in conn.execute("SELECT entity_id FROM source1")]
+    if num_shards > 1 or select != "all" or s1_list:
+        if s1_list:
+            with open(s1_list, encoding="utf-8") as f:
+                next(f)
+                all_ids = [ln.strip() for ln in f if ln.strip()]
+            print(f"  s1-list: {len(all_ids)} entities from {s1_list}", flush=True)
+        else:
+            all_ids = [r[0] for r in conn.execute("SELECT entity_id FROM source1")]
+        if select == "val":
+            from train import stable_bucket, VAL_FRACTION_HASH
+            all_ids = [e for e in all_ids if stable_bucket(e) < VAL_FRACTION_HASH]
+            if limit_s1:
+                all_ids = all_ids[:limit_s1]
+            limit_s1 = None
+            print(f"  select=val: {len(all_ids)} held-out entities", flush=True)
         shard_ids = [e for i, e in enumerate(all_ids) if i % num_shards == shard]
         print(f"  shard {shard}/{num_shards}: {len(shard_ids)} of {len(all_ids)} entities", flush=True)
 
@@ -115,6 +143,8 @@ def run(db_path, models_dir, candidate_out, matching_out, limit_s1=None,
 
     cand_f.close()
     match_f.close()
+    if score_f is not None:
+        score_f.close()
     conn.close()
     print(f"  DONE: {n_entities} entities, {n_with_match} with >=1 predicted match", flush=True)
 
@@ -133,6 +163,17 @@ if __name__ == "__main__":
     ap.add_argument("--num-shards", type=int, default=1,
                     help="Run N workers in parallel over disjoint entity slices, "
                          "then merge with merge_shards.py.")
+    ap.add_argument("--scores-out", default=None,
+                    help="Also dump every scored pair (s1, cand, prob) for assign.py.")
+    ap.add_argument("--score-floor", type=float, default=0.05,
+                    help="Only dump pairs with prob >= this (keeps the file small).")
+    ap.add_argument("--select", choices=["all", "val"], default="all",
+                    help="'val' = only held-out validation-bucket entities (train.db).")
+    ap.add_argument("--s1-list", default=None,
+                    help="Only process the Source-1 ids in this file (one per line, "
+                         "with a header), e.g. the output of conflicts.py --write-entities.")
     args = ap.parse_args()
     run(args.db, args.models_dir, args.candidate_out, args.matching_out,
-        limit_s1=args.limit_s1, shard=args.shard, num_shards=args.num_shards)
+        limit_s1=args.limit_s1, shard=args.shard, num_shards=args.num_shards,
+        scores_out=args.scores_out, score_floor=args.score_floor, select=args.select,
+        s1_list=args.s1_list)
