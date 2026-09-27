@@ -68,9 +68,15 @@ def score_pairs(models, F, qi_a, ctx_extra=False):
 
 
 def run_country(country, q_ids, s1rec, args, models, rule, kv, channels, max_df):
-    out_c = os.path.join(args.out_dir, f"cand_{country}.tsv")
-    out_s = os.path.join(args.out_dir, f"scores_{country}.tsv")
-    out_m = os.path.join(args.out_dir, f"match_{country}.tsv")
+    tag = country
+    if args.q_num_shards > 1:
+        # A slice of this country's queries, for when the whole country
+        # cannot finish in time. Rows merge by entity id (hybrid_merge.py).
+        q_ids = [e for i, e in enumerate(sorted(q_ids)) if i % args.q_num_shards == args.q_shard]
+        tag = f"{country}__s{args.q_shard}of{args.q_num_shards}"
+    out_c = os.path.join(args.out_dir, f"cand_{tag}.tsv")
+    out_s = os.path.join(args.out_dir, f"scores_{tag}.tsv")
+    out_m = os.path.join(args.out_dir, f"match_{tag}.tsv")
     if os.path.exists(out_m) and not args.force:
         mc.log(f"\n=== {country}: already done, skipping ({out_m}) ===")
         return
@@ -186,6 +192,9 @@ def main():
                     help="Override decision rule, e.g. 'thresh thr=0.6 top_n=None exclusive=True'.")
     ap.add_argument("--force", action="store_true", help="Recompute finished countries.")
     ap.add_argument("--merge-only", action="store_true")
+    ap.add_argument("--q-shard", type=int, default=0,
+                    help="Process only this slice of each country's queries.")
+    ap.add_argument("--q-num-shards", type=int, default=1)
     ap.add_argument("--cache-dir", default="work/mc_cache",
                     help="Normalized target records are cached here per country.")
     ap.add_argument("--prep-only", action="store_true",

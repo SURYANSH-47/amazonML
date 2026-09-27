@@ -33,19 +33,25 @@ def read_rows(path):
     return rows
 
 
-def assemble(kind, header, s1_country, new_countries, new_dir, old_path, out_path):
+def assemble(kind, header, s1_country, new_dir, old_path, out_path):
+    """Row-level merge: any entity with a row in a new-run file (whole
+    country or a query slice) takes it; everyone else falls back to old."""
     new_rows = {}
-    for c in new_countries:
-        new_rows.update(read_rows(os.path.join(new_dir, f"{kind}_{c}.tsv")))
+    files = sorted(f for f in os.listdir(new_dir)
+                   if f.startswith(kind + "_") and f.endswith(".tsv"))
+    for f in files:
+        new_rows.update(read_rows(os.path.join(new_dir, f)))
     old_rows = read_rows(old_path)
     n_new = n_old = 0
+    by_c = {}
     missing = []
     with open(out_path, "w", encoding="utf-8", newline="") as fo:
         fo.write(header + "\n")
         for s1, country in s1_country.items():
-            if country in new_countries:
-                row = new_rows.get(s1)
-                n_new += row is not None
+            row = new_rows.get(s1)
+            if row is not None:
+                n_new += 1
+                by_c[country] = by_c.get(country, 0) + 1
             else:
                 row = old_rows.get(s1)
                 n_old += row is not None
@@ -56,8 +62,8 @@ def assemble(kind, header, s1_country, new_countries, new_dir, old_path, out_pat
     if missing:
         sys.exit(f"ERROR: {len(missing)} entities missing from {kind} sources, "
                  f"e.g. {missing[:5]}")
-    print(f"  {out_path}: {n_new} rows from new run ({', '.join(sorted(new_countries))}), "
-          f"{n_old} rows from old run — all {len(s1_country)} entities present", flush=True)
+    print(f"  {out_path}: {n_new} rows from new run {by_c}, {n_old} from old run "
+          f"(files: {', '.join(files)}) - all {len(s1_country)} entities present", flush=True)
 
 
 def main():
@@ -77,23 +83,21 @@ def main():
             if row:
                 s1_country[row[0]] = row[3] if len(row) > 3 else ""
 
-    new_countries = {f[6:-4] for f in os.listdir(args.new_dir)
-                     if f.startswith("match_") and f.endswith(".tsv")}
-    print(f"new-run countries found: {sorted(new_countries)}", flush=True)
-
-    assemble("match", "source1_entity_id\tmatched_entity_ids", s1_country, new_countries,
+    assemble("match", "source1_entity_id\tmatched_entity_ids", s1_country,
              args.new_dir, args.old_matching,
              os.path.join(args.out_dir, "matching_results.tsv"))
 
-    cand_new = all(os.path.exists(os.path.join(args.new_dir, f"cand_{c}.tsv"))
-                   for c in new_countries)
-    if args.old_candidates and cand_new:
+    # Candidates must come from the same run as each entity's matches, so only
+    # write candidate_pairs when every new match file has its cand file.
+    matches = {f[6:] for f in os.listdir(args.new_dir) if f.startswith("match_")}
+    cands = {f[5:] for f in os.listdir(args.new_dir) if f.startswith("cand_")}
+    if args.old_candidates and matches <= cands:
         assemble("cand", "source1_entity_id\tcandidate_entity_ids", s1_country,
-                 new_countries, args.new_dir, args.old_candidates,
+                 args.new_dir, args.old_candidates,
                  os.path.join(args.out_dir, "candidate_pairs.tsv"))
     else:
-        print("  candidate_pairs.tsv not written (needs --old-candidates and "
-              "cand_<C>.tsv for every new country)", flush=True)
+        print("  candidate_pairs.tsv not written (needs --old-candidates and a "
+              "cand_ file for every match_ file)", flush=True)
 
 
 if __name__ == "__main__":
