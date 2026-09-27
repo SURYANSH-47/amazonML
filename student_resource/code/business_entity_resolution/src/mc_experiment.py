@@ -139,7 +139,34 @@ def load_gt(path, want):
 
 # -------------------------------------------------------------- channels
 
-def tfidf_topk(q_text, t_text, k, analyzer, max_df, q_chunk=200_000):
+# Query-side n-gram pruning: each query searches with only its `keep`
+# highest-weight (i.e. rarest) fragments. Search cost per query is the sum of
+# the posting-list lengths of its fragments, which is dominated by the common
+# ones ("del", "mum", "roa") that carry almost no identifying signal. At the
+# full 70k validation queries the unpruned search extrapolated to ~12h for
+# the 1.73M test queries; pruning attacks exactly that cost.
+QKEEP = {"c2": 14, "c2b": 12, "c3": 22}
+
+
+def prune_query_rows(Q, keep):
+    """Keep each row's `keep` largest entries; drop the rest."""
+    Q = Q.tocsr()
+    ip, dt = Q.indptr, Q.data
+    lens = np.diff(ip)
+    if not len(lens) or lens.max() <= keep:
+        return Q
+    mask = np.ones(len(dt), dtype=bool)
+    for i in np.nonzero(lens > keep)[0]:
+        a, b = ip[i], ip[i + 1]
+        n_drop = (b - a) - keep
+        mask[a + np.argpartition(dt[a:b], n_drop)[:n_drop]] = False
+    rows = np.repeat(np.arange(len(lens)), lens)
+    counts = np.bincount(rows[mask], minlength=len(lens))
+    new_ip = np.concatenate([[0], np.cumsum(counts)]).astype(ip.dtype)
+    return sp.csr_matrix((dt[mask], Q.indices[mask], new_ip), shape=Q.shape)
+
+
+def tfidf_topk(q_text, t_text, k, analyzer, max_df, keep=None, q_chunk=200_000):
     """Top-k cosine neighbours as a CSR matrix (row = query, sorted desc).
 
     Queries are multiplied in chunks so the transient product for 1.7M
@@ -150,15 +177,20 @@ def tfidf_topk(q_text, t_text, k, analyzer, max_df, q_chunk=200_000):
                           max_df=max_df, sublinear_tf=True, dtype=np.float32)
     T = vec.fit_transform(t_text)
     Q = vec.transform(q_text)
+    if keep:
+        Q = prune_query_rows(Q, keep)
     TT = T.T.tocsr()
     del T
+    t1 = time.time()
     parts = []
     for s in range(0, Q.shape[0], q_chunk):
         parts.append(sp_matmul_topn(Q[s:s + q_chunk], TT, top_n=k, sort=True,
                                     n_threads=THREADS))
     R = sp.vstack(parts).tocsr() if len(parts) > 1 else parts[0].tocsr()
-    log(f"      {analyzer} top-{k}: vocab={len(vec.vocabulary_)} "
-        f"queries={Q.shape[0]} ({time.time()-t0:.0f}s)")
+    t2 = time.time()
+    log(f"      {analyzer} top-{k} keep={keep}: vocab={len(vec.vocabulary_)} "
+        f"queries={Q.shape[0]} (fit {t1-t0:.0f}s, search {t2-t1:.0f}s = "
+        f"{1000*(t2-t1)/max(Q.shape[0],1):.2f} ms/query)")
     del TT, Q, vec, parts
     gc.collect()
     return R
@@ -358,12 +390,29 @@ def pair_features(Q, T, qi, ti, chan, wm=None):
 
 # ------------------------------------------------------------ one country
 
-def load_country(country, q_ids, s1rec, split_dir, split):
+def load_country(country, q_ids, s1rec, split_dir, split, cache_dir=None):
+    """Target records are cached after normalization: normalizing ~5M records
+    takes 10-12 min, reloading the pickle ~1 min."""
     t0 = time.time()
-    tids, tsrc, tnames, taddrs = load_targets(split_dir, split, country)
-    log(f"  targets: {len(tids)} ({time.time()-t0:.0f}s)")
-    T = Records(tids, tsrc, tnames, taddrs)
-    del tnames, taddrs
+    cache = (os.path.join(cache_dir, f"records_{split}_{country}.pkl")
+             if cache_dir else None)
+    if cache and os.path.exists(cache):
+        import pickle
+        with open(cache, "rb") as f:
+            T = pickle.load(f)
+        log(f"  targets: {T.n} from cache ({time.time()-t0:.0f}s)")
+    else:
+        tids, tsrc, tnames, taddrs = load_targets(split_dir, split, country)
+        log(f"  targets: {len(tids)} ({time.time()-t0:.0f}s)")
+        T = Records(tids, tsrc, tnames, taddrs)
+        del tnames, taddrs
+        if cache:
+            import pickle
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(cache + ".part", "wb") as f:
+                pickle.dump(T, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(cache + ".part", cache)
+            log(f"  cached targets -> {cache}")
     Q = Records(q_ids, [1] * len(q_ids), [s1rec[e][0] for e in q_ids],
                 [s1rec[e][1] for e in q_ids])
     return Q, T
@@ -373,11 +422,11 @@ def retrieve(Q, T, channels, max_df):
     """Run every enabled channel once for all queries of a country."""
     R = {}
     if "c2" in channels:
-        R["c2"] = tfidf_topk(Q.name, T.name, TOPK["c2"], "char_wb", max_df)
+        R["c2"] = tfidf_topk(Q.name, T.name, TOPK["c2"], "char_wb", max_df, QKEEP.get("c2"))
     if "c2b" in channels:
-        R["c2b"] = tfidf_topk(Q.phonc, T.phonc, TOPK["c2b"], "char", max_df)
+        R["c2b"] = tfidf_topk(Q.phonc, T.phonc, TOPK["c2b"], "char", max_df, QKEEP.get("c2b"))
     if "c3" in channels:
-        R["c3"] = tfidf_topk(Q.addr, T.addr, TOPK["c3"], "char_wb", max_df)
+        R["c3"] = tfidf_topk(Q.addr, T.addr, TOPK["c3"], "char_wb", max_df, QKEEP.get("c3"))
     c4 = exact_channel(Q, T) if "c4" in channels else {}
     return R, c4
 
@@ -385,7 +434,8 @@ def retrieve(Q, T, channels, max_df):
 def run_country(country, q_ids, s1rec, split_dir, split, args, c1_all):
     log(f"\n=== {country}: {len(q_ids)} queries ===")
     t0 = time.time()
-    Q, T = load_country(country, q_ids, s1rec, split_dir, split)
+    Q, T = load_country(country, q_ids, s1rec, split_dir, split,
+                        os.path.join(args.out_dir, "cache"))
     tpos = {e: i for i, e in enumerate(T.ids)}
     R, c4 = retrieve(Q, T, args.channels, args.max_df)
 
@@ -509,6 +559,75 @@ def final_report(ids, gt, per):
 
 # ------------------------------------------------------------------ main
 
+# ------------------------------------------------------- two-stage reranker
+#
+# A pairwise model scores each candidate in isolation. But the question that
+# actually decides the score is comparative: of this business's ~150
+# candidates, which ones are it? A same-name chain store and the true match
+# can look alike in isolation and very different side by side. Stage 2 sees
+# each candidate's stage-1 score relative to its rivals for the same entity.
+
+CTX_FEATURES = ["p1", "p1_rank", "p1_rel", "p1_gap_other",
+                "ent_cands", "ent_n_hi", "ent_sum"]
+
+
+def context_features(group, p1):
+    """Per-pair features comparing p1 to the other candidates of the same
+    entity. group: int entity code per pair; p1: stage-1 probabilities."""
+    n = len(p1)
+    if n == 0:
+        return np.zeros((0, len(CTX_FEATURES)), np.float32)
+    p1 = np.asarray(p1, np.float32)
+    group = np.asarray(group)
+    order = np.lexsort((-p1, group))
+    gs, ps = group[order], p1[order]
+    starts = np.r_[0, np.nonzero(gs[1:] != gs[:-1])[0] + 1]
+    sizes = np.diff(np.r_[starts, n])
+    top1 = ps[starts]
+    top2 = np.where(sizes > 1, ps[np.minimum(starts + 1, n - 1)], 0.0)
+    rank_s = np.arange(n) - np.repeat(starts, sizes) + 1
+    gid_s = np.repeat(np.arange(len(starts)), sizes)
+    csum = np.add.reduceat(ps, starts)
+    nhi = np.add.reduceat((ps > 0.5).astype(np.float32), starts)
+    inv = np.empty(n, np.int64)
+    inv[order] = np.arange(n)
+    gid, rank = gid_s[inv], rank_s[inv]
+    t1, t2 = top1[gid], top2[gid]
+    rel = np.divide(p1, t1, out=np.zeros(n, np.float32), where=t1 > 0)
+    gap = np.where(rank == 1, p1 - t2, p1 - t1)
+    return np.column_stack([p1, rank, rel, gap, sizes[gid], nhi[gid],
+                            csum[gid]]).astype(np.float32)
+
+
+LGB_PARAMS = dict(objective="binary", metric="binary_logloss", learning_rate=0.05,
+                  num_leaves=127, min_data_in_leaf=40, feature_fraction=0.9,
+                  bagging_fraction=0.9, bagging_freq=1, verbose=-1, seed=42,
+                  num_threads=THREADS)
+
+
+def train_lgb(X, y, names):
+    import lightgbm as lgb
+    rng = np.random.RandomState(42)
+    idx = rng.permutation(len(X))
+    nd = max(len(idx) // 10, 1)
+    dtr = lgb.Dataset(X[idx[nd:]], y[idx[nd:]], feature_name=names)
+    ddv = lgb.Dataset(X[idx[:nd]], y[idx[:nd]], reference=dtr)
+    m = lgb.train(LGB_PARAMS, dtr, 3000, valid_sets=[ddv],
+                  callbacks=[lgb.early_stopping(50, verbose=False)])
+    return m
+
+
+def scored_lists(s1, cand, p, ids):
+    per = defaultdict(list)
+    for e, c, pr in zip(s1, cand, p):
+        per[e].append((float(pr), c))
+    for v in per.values():
+        v.sort(reverse=True)
+    for e in ids:
+        per.setdefault(e, [])
+    return per
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-dir", default="dataset")
@@ -520,6 +639,8 @@ def main():
     ap.add_argument("--db", default=None, help="Enable channel c1 using this SQLite DB.")
     ap.add_argument("--c1-topk", type=int, default=100)
     ap.add_argument("--max-df", type=float, default=0.02)
+    ap.add_argument("--from-cache", action="store_true",
+                    help="Reuse cached union+features; only retrain/re-evaluate the reranker.")
     args = ap.parse_args()
     args.channels = set(args.channels.split(","))
     if args.db:
@@ -535,27 +656,38 @@ def main():
     gt = load_gt(os.path.join(split_dir, f"{args.split}_ground_truth.tsv"), want)
     log(f"val {len(val)}, fit {len(fit)}, channels {sorted(args.channels)}")
 
-    c1_all = c1_channel(args.db, sorted(want), args.c1_topk) if args.db else {}
+    cache = os.path.join(args.out_dir, "cache", "union_features.npz")
+    if args.from_cache and os.path.exists(cache):
+        z = np.load(cache, allow_pickle=True)
+        s1, cand, F = z["s1"], z["cand"], z["F"]
+        membership = z["membership"].item()
+        by_country = z["by_country"].item()
+        log(f"loaded {len(s1)} union pairs from cache (retrieval skipped)")
+    else:
+        c1_all = c1_channel(args.db, sorted(want), args.c1_topk) if args.db else {}
+        by_country = defaultdict(list)
+        for e in sorted(want):
+            by_country[s1rec[e][2]].append(e)
+        by_country = dict(by_country)
+        parts = []
+        for country, q_ids in sorted(by_country.items()):
+            parts.append(run_country(country, q_ids, s1rec, split_dir, args.split, args, c1_all))
+        s1 = np.concatenate([p["s1"] for p in parts])
+        cand = np.concatenate([p["cand"] for p in parts])
+        F = np.vstack([p["F"] for p in parts])
+        membership = {}
+        for p in parts:
+            for ch, m in p["membership"].items():
+                membership.setdefault(ch, {}).update(m)
+        del parts
+        gc.collect()
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        np.savez(cache, s1=s1, cand=cand, F=F,
+                 membership=np.array(membership, dtype=object),
+                 by_country=np.array(by_country, dtype=object))
+        log(f"cached union features -> {cache}")
 
-    by_country = defaultdict(list)
-    for e in sorted(want):
-        by_country[s1rec[e][2]].append(e)
-
-    parts = []
-    for country, q_ids in sorted(by_country.items()):
-        parts.append(run_country(country, q_ids, s1rec, split_dir, args.split, args, c1_all))
-
-    s1 = np.concatenate([p["s1"] for p in parts])
-    cand = np.concatenate([p["cand"] for p in parts])
-    F = np.vstack([p["F"] for p in parts])
     y = np.fromiter((c in gt.get(e, ()) for e, c in zip(s1, cand)), dtype=np.int8, count=len(s1))
-    membership = defaultdict(dict)
-    for p in parts:
-        for ch, m in p["membership"].items():
-            membership[ch].update(m)
-    del parts
-    gc.collect()
-
     union = defaultdict(set)
     for e, c in zip(s1, cand):
         union[e].add(c)
@@ -568,47 +700,74 @@ def main():
         cv = [e for e in val if s1rec[e][2] == country]
         if cv:
             retrieval_report(f"U:{country[:5]}", cv, gt, union)
+    # Leave-one-out: how much union recall each channel uniquely contributes.
+    chans = [c for c in ("c1", "c2", "c2b", "c3", "c4") if c in membership]
+    log("  leave-one-out (union recall WITHOUT the channel):")
+    for c in chans:
+        rest = defaultdict(set)
+        for o in chans:
+            if o != c:
+                for e, s in membership[o].items():
+                    rest[e] |= s
+        tot = found = 0
+        for e in val:
+            t = gt.get(e, set())
+            tot += len(t); found += len(t & rest.get(e, set()))
+        log(f"    without {c:<4} {found/max(tot,1):.4f}")
 
     is_val = np.isin(s1, np.asarray(val))
-    import lightgbm as lgb
-    Xf, yf = F[~is_val], y[~is_val]
-    rng = np.random.RandomState(42)
-    idx = rng.permutation(len(Xf))
-    nd = len(idx) // 10
-    dtr = lgb.Dataset(Xf[idx[nd:]], yf[idx[nd:]], feature_name=FEATURES)
-    ddv = lgb.Dataset(Xf[idx[:nd]], yf[idx[:nd]], reference=dtr)
-    params = dict(objective="binary", metric="binary_logloss", learning_rate=0.05,
-                  num_leaves=127, min_data_in_leaf=40, feature_fraction=0.9,
-                  bagging_fraction=0.9, bagging_freq=1, verbose=-1, seed=42,
-                  num_threads=THREADS)
+    fit_m = ~is_val
+    codes = np.unique(s1, return_inverse=True)[1]
     t1 = time.time()
-    booster = lgb.train(params, dtr, 2000, valid_sets=[ddv],
-                        callbacks=[lgb.early_stopping(50, verbose=False)])
-    log(f"\nreranker: {booster.best_iteration} rounds, "
-        f"{len(Xf)} training pairs (pos rate {yf.mean():.3f}) ({time.time()-t1:.0f}s)")
 
-    pv = booster.predict(F[is_val], num_iteration=booster.best_iteration)
-    per = defaultdict(list)
-    for e, c, p in zip(s1[is_val], cand[is_val], pv):
-        per[e].append((float(p), c))
-    for v in per.values():
-        v.sort(reverse=True)
-    for e in val:
-        per.setdefault(e, [])
-    best = final_report(val, gt, per)
+    # Stage 1: out-of-fold scores for training entities (so stage 2 learns
+    # from scores it will see at inference, not overfit in-sample ones).
+    p1 = np.zeros(len(F), np.float32)
+    fold = codes % 3
+    for k in range(3):
+        tr, te = fit_m & (fold != k), fit_m & (fold == k)
+        mk = train_lgb(F[tr], y[tr], FEATURES)
+        p1[te] = mk.predict(F[te], num_iteration=mk.best_iteration)
+    m1 = train_lgb(F[fit_m], y[fit_m], FEATURES)
+    p1[is_val] = m1.predict(F[is_val], num_iteration=m1.best_iteration)
+    log(f"\nstage 1: {m1.best_iteration} rounds, {int(fit_m.sum())} training pairs "
+        f"(pos rate {y[fit_m].mean():.3f}) ({time.time()-t1:.0f}s)")
 
-    booster.save_model(os.path.join(args.out_dir, "mc_model.txt"),
-                       num_iteration=booster.best_iteration)
-    imp = sorted(zip(FEATURES, booster.feature_importance("gain")), key=lambda x: -x[1])
+    per1 = scored_lists(s1[is_val], cand[is_val], p1[is_val], val)
+    log("\n--- STAGE 1 (pairwise only) ---")
+    best1 = final_report(val, gt, per1)
+
+    t2 = time.time()
+    F2 = np.hstack([F, context_features(codes, p1)])
+    m2 = train_lgb(F2[fit_m], y[fit_m], FEATURES + CTX_FEATURES)
+    p2 = m2.predict(F2[is_val], num_iteration=m2.best_iteration)
+    log(f"\nstage 2: {m2.best_iteration} rounds ({time.time()-t2:.0f}s)")
+    per2 = scored_lists(s1[is_val], cand[is_val], p2, val)
+    log("\n--- STAGE 2 (with rival-candidate context) ---")
+    best2 = final_report(val, gt, per2)
+
+    two_stage = best2[0] > best1[0]
+    best = best2 if two_stage else best1
+    m1.save_model(os.path.join(args.out_dir, "mc_m1.txt"), num_iteration=m1.best_iteration)
+    m2.save_model(os.path.join(args.out_dir, "mc_m2.txt"), num_iteration=m2.best_iteration)
+    mb = m2 if two_stage else m1
+    names = FEATURES + CTX_FEATURES if two_stage else FEATURES
+    imp = sorted(zip(names, mb.feature_importance("gain")), key=lambda x: -x[1])
     with open(os.path.join(args.out_dir, "mc_report.json"), "w") as f:
         json.dump({"best_f05": best[0], "best_precision": best[1], "best_recall": best[2],
-                   "best_config": best[3], "features": FEATURES,
+                   "best_config": best[3], "two_stage": bool(two_stage),
+                   "stage1_f05": best1[0], "stage2_f05": best2[0],
+                   "features": FEATURES, "ctx_features": CTX_FEATURES,
                    "importance": [(k, float(v)) for k, v in imp],
-                   "channels": sorted(args.channels), "topk": TOPK,
-                   "max_df": args.max_df}, f, indent=2)
+                   "channels": sorted(c for c in args.channels if c != "c1"),
+                   "topk": TOPK, "qkeep": QKEEP, "max_df": args.max_df}, f, indent=2)
     log("\n  top features by gain: " + ", ".join(k for k, _ in imp[:10]))
-    log(f"\nTOTAL {time.time()-T0:.0f}s  |  BEST macro F0.5 {best[0]:.4f}  "
-        f"(baseline to beat: 0.7930)")
+    log(f"\nTOTAL {time.time()-T0:.0f}s  |  stage 1 {best1[0]:.4f}  |  stage 2 {best2[0]:.4f}"
+        f"  |  USING {'stage 2' if two_stage else 'stage 1'}: {best[0]:.4f}  "
+        f"(previous run 0.8883, old architecture 0.7930)")
+    log("Model files for the other laptop: mc_m1.txt, mc_m2.txt, mc_report.json "
+        f"in {args.out_dir}")
+
 
 
 if __name__ == "__main__":

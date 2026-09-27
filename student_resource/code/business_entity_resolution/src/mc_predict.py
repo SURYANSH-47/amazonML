@@ -12,7 +12,7 @@ skipped on re-run if already complete, so a crash costs one country, not
 the whole run.
 
     python src/mc_predict.py --dataset-dir dataset --split test \
-        --model work/mc/mc_model.txt --report work/mc/mc_report.json \
+        --report work/mc/mc_report.json \
         --out-dir output/mc
 """
 
@@ -56,7 +56,18 @@ def make_decider(rule, kv):
     return decide
 
 
-def run_country(country, q_ids, s1rec, args, booster, rule, kv, channels, max_df):
+def score_pairs(models, F, qi_a):
+    """Stage-1 score, plus stage 2 over rival-candidate context if enabled.
+    Chunks are whole queries, so every candidate of an entity is present when
+    its context features are computed — same as in validation."""
+    m1, m2 = models
+    p = m1.predict(F)
+    if m2 is not None:
+        p = m2.predict(np.hstack([F, mc.context_features(qi_a, p)]))
+    return p
+
+
+def run_country(country, q_ids, s1rec, args, models, rule, kv, channels, max_df):
     out_c = os.path.join(args.out_dir, f"cand_{country}.tsv")
     out_s = os.path.join(args.out_dir, f"scores_{country}.tsv")
     out_m = os.path.join(args.out_dir, f"match_{country}.tsv")
@@ -67,7 +78,7 @@ def run_country(country, q_ids, s1rec, args, booster, rule, kv, channels, max_df
     t0 = time.time()
     split_dir = os.path.join(args.dataset_dir, args.split)
 
-    Q, T = mc.load_country(country, q_ids, s1rec, split_dir, args.split)
+    Q, T = mc.load_country(country, q_ids, s1rec, split_dir, args.split, args.cache_dir)
     R, c4 = mc.retrieve(Q, T, channels, max_df)
     t1 = time.time()
     wm = mc.build_word_mats(Q, T)
@@ -85,7 +96,7 @@ def run_country(country, q_ids, s1rec, args, booster, rule, kv, channels, max_df
             by_q = defaultdict(list)
             if len(qi_a):
                 F = mc.pair_features(Q, T, qi_a, ti_a, chan, wm)
-                p = booster.predict(F)
+                p = score_pairs(models, F, qi_a)
                 del F
                 for q, t, pr in zip(qi_a, ti_a, p):
                     by_q[q].append((float(pr), t))
@@ -165,8 +176,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-dir", default="dataset")
     ap.add_argument("--split", default="test")
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--report", required=True, help="mc_report.json from mc_experiment.py")
+    ap.add_argument("--report", default=None,
+                    help="mc_report.json from mc_experiment.py; mc_m1.txt / mc_m2.txt must sit next to it.")
     ap.add_argument("--out-dir", default="output/mc")
     ap.add_argument("--countries", default=None, help="Comma list; default all.")
     ap.add_argument("--chunk", type=int, default=40000)
@@ -175,17 +186,37 @@ def main():
                     help="Override decision rule, e.g. 'thresh thr=0.6 top_n=None exclusive=True'.")
     ap.add_argument("--force", action="store_true", help="Recompute finished countries.")
     ap.add_argument("--merge-only", action="store_true")
+    ap.add_argument("--cache-dir", default="work/mc_cache",
+                    help="Normalized target records are cached here per country.")
+    ap.add_argument("--prep-only", action="store_true",
+                    help="Only normalize+cache target records for --countries, then exit. "
+                         "Needs no model; lets a second laptop get ahead while training runs.")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+    split_dir = os.path.join(args.dataset_dir, args.split)
+
+    if args.prep_only:
+        want = args.countries.split(",") if args.countries else ["France", "India", "US"]
+        for country in want:
+            mc.log(f"\n=== prep {country} ===")
+            mc.load_country(country, [], {}, split_dir, args.split, args.cache_dir)
+        mc.log("prep done")
+        return
 
     with open(args.report) as f:
         rep = json.load(f)
     mc.TOPK.update(rep["topk"])
+    mc.QKEEP.update(rep.get("qkeep", {}))
     channels = set(rep["channels"]) - {"c1"}
     max_df = rep["max_df"]
     rule, kv = parse_config(args.config or rep["best_config"])
-    mc.log(f"channels {sorted(channels)}, topk {mc.TOPK}, max_df {max_df}")
-    mc.log(f"decision: {rule} {kv}")
+    mdir = os.path.dirname(args.report)
+    m1 = lgb.Booster(model_file=os.path.join(mdir, "mc_m1.txt"))
+    m2 = (lgb.Booster(model_file=os.path.join(mdir, "mc_m2.txt"))
+          if rep.get("two_stage") else None)
+    mc.log(f"channels {sorted(channels)}, topk {mc.TOPK}, qkeep {mc.QKEEP}, max_df {max_df}")
+    mc.log(f"reranker: {'two-stage' if m2 is not None else 'stage 1 only'}; "
+           f"decision: {rule} {kv}")
 
     s1_path = os.path.join(args.dataset_dir, args.split, f"{args.split}_source1.tsv")
     s1rec = {}
@@ -201,12 +232,11 @@ def main():
     mc.log("queries per country: " + ", ".join(f"{c} {len(v)}" for c, v in sorted(by_country.items())))
 
     if not args.merge_only:
-        booster = lgb.Booster(model_file=args.model)
         want = set(args.countries.split(",")) if args.countries else set(by_country)
         # Smallest first: a failure surfaces fast, and each finished country
         # is banked on disk.
         for country in sorted(want, key=lambda c: len(by_country[c])):
-            run_country(country, by_country[country], s1rec, args, booster,
+            run_country(country, by_country[country], s1rec, args, (m1, m2),
                         rule, kv, channels, max_df)
 
     done = {f[6:-4] for f in os.listdir(args.out_dir)
